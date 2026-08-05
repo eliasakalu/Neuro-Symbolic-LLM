@@ -1,54 +1,29 @@
-"""Tier-1 frozen base: one torch forward pass, per-layer hidden states cached.
+"""Tier-1 frozen base: one JAX forward pass, per-layer hidden states cached.
 
-This module owns the *static substrate* of the residual stack. It loads a
-pretrained GPT-2-style causal LM (HuggingFace ``transformers``, PyTorch), runs
-it exactly once per batch under ``torch.no_grad()``, and returns the per-layer
-hidden states ``h_0^l`` as JAX arrays. Those cached activations are the static
-reference points that the PC residual fabric settles against, so the base is
-never re-run during the K inference iterations ("activation caching").
+This module owns the static substrate of the residual stack. It loads a
+pretrained GPT-2-style causal LM via Hugging Face Flax (JAX-native), runs it
+exactly once per batch, and returns the per-layer hidden states h_0^l as JAX
+arrays. Those cached activations are the static reference points that the PC
+residual fabric settles against, so the base is never re-run during the K
+inference iterations ("activation caching").
 
-The weights ``theta_0`` deliberately live here — in a Python-level registry —
-and never inside a ``fabricpc.core.types.GraphParams`` tree, so the Optax
-optimizer can never see or update them. That is the freeze mechanism.
-
-Example:
-    >>> from fabricpc_ext.base_forward import FrozenBase
-    >>> base = FrozenBase(tiny_config(model_id="tiny-gpt2"))
-    >>> h_all = base.hidden_states(tokens)   # dict: layer_index -> jnp array
+The parameters theta_0 deliberately live outside the GraphParams tree so Optax
+optimizers can never see or update them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Any, Tuple
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-
-# torch is imported lazily so that importing this package never requires a
-# torch build; the frozen base is the only consumer of PyTorch.
-_torch = None
+from transformers import FlaxGPT2Config, FlaxGPT2Model
 
 
 @dataclass(frozen=True)
 class BaseModelConfig:
-    """Configuration of the frozen base model.
-
-    Attributes:
-        model_id: A HuggingFace hub id (e.g. ``"gpt2"``) or the reserved
-            sentinel ``"tiny-gpt2"`` which builds a small random GPT-2 from a
-            config (offline, for tests and CPU smoke runs).
-        layer_indices: Base transformer layers whose hidden states the residual
-            fabric attaches to (0-based transformer layer ids). Hidden state
-            ``l`` is the output of transformer layer ``l``; the token embedding
-            output is index -1 and is never exposed.
-        vocab_size: Model vocabulary size (used for the tiny sentinel only).
-        max_seq_len: Maximum sequence length / position ids.
-        hidden_size: Transformer embedding dimension.
-        num_layers: Transformer depth.
-        num_heads: Attention heads.
-    """
+    """Configuration of the frozen base model."""
 
     model_id: str = "tiny-gpt2"
     layer_indices: Tuple[int, ...] = (0,)
@@ -67,22 +42,9 @@ class BaseModelConfig:
         return self.model_id == "tiny-gpt2"
 
 
-def _load_torch() -> "Any":
-    """Import torch on first use (avoids import cost when unused)."""
-    global _torch
-    if _torch is None:
-        import torch
-
-        _torch = torch
-    return _torch
-
-
-def _build_tiny_model(config: BaseModelConfig):
-    """Construct a small random GPT-2 for offline runs."""
-    torch = _load_torch()
-    from transformers import GPT2Config, GPT2Model
-
-    gpt2_config = GPT2Config(
+def _build_tiny_model(config: BaseModelConfig, prng_key: jax.Array) -> FlaxGPT2Model:
+    """Construct a small random GPT-2 for offline JAX/Flax runs."""
+    flax_config = FlaxGPT2Config(
         vocab_size=config.vocab_size,
         n_positions=config.max_seq_len,
         n_ctx=config.max_seq_len,
@@ -93,75 +55,53 @@ def _build_tiny_model(config: BaseModelConfig):
         embd_pdrop=0.0,
         attn_pdrop=0.0,
     )
-    model = GPT2Model(gpt2_config)
-    for param in model.parameters():
-        with torch.no_grad():
-            param.normal_(std=0.02)
-    return model
+    # Instantiate Flax model directly from config with JAX key initialization
+    return FlaxGPT2Model(flax_config, seed=int(prng_key[0]))
 
 
 class FrozenBase:
-    """Frozen GPT-2 substrate with a one-time-forward activation cache.
+    """Frozen JAX/Flax GPT-2 substrate with a one-time forward activation cache."""
 
-    The instance holds the torch model in evaluation mode. Each call to
-    :meth:`hidden_states` is exactly one forward pass; the returned dictionary
-    of JAX arrays is the Tier-1 activation cache consumed by the residual
-    fabric graph.
-    """
-
-    def __init__(self, config: BaseModelConfig, device: Optional[str] = None):
+    def __init__(self, config: BaseModelConfig, prng_key: Optional[jax.Array] = None):
         self.config = config
-        torch = _load_torch()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
+
         if config.is_tiny:
-            self.model = _build_tiny_model(config)
+            self.model = _build_tiny_model(config, prng_key)
         else:
-            from transformers import GPT2Model
+            self.model = FlaxGPT2Model.from_pretrained(config.model_id)
 
-            self.model = GPT2Model.from_pretrained(config.model_id)
-        self.model.to(self.device)
-        self.model.eval()
-
-    def hidden_states(
-        self, token_ids: jnp.ndarray
-    ) -> Dict[str, jnp.ndarray]:
-        """Run the frozen base once and return cached hidden states.
+    def hidden_states(self, token_ids: jnp.ndarray) -> Dict[str, jnp.ndarray]:
+        """Run the frozen base once using JAX and return cached hidden states.
 
         Args:
-            token_ids: Integer token ids, shape ``(batch, seq_len)``.
+            token_ids: Integer token ids JAX array, shape ``(batch, seq_len)``.
 
         Returns:
             Dict mapping ``f"h{l}"`` (one per ``config.layer_indices`` entry)
             to the layer ``l`` hidden state, shape ``(batch, seq_len, d)``.
         """
-        torch = _load_torch()
-        tokens = torch.as_tensor(np.asarray(token_ids), device=self.device)
-        with torch.no_grad():
-            outputs = self.model(tokens, output_hidden_states=True)
-        hidden_states = outputs.hidden_states  # [embed, h0, h1, ..., hL-1]
+        # Run Flax forward pass; output_hidden_states=True returns all intermediate layers
+        outputs = self.model(input_ids=token_ids, output_hidden_states=True)
+        hidden_states = outputs.hidden_states  # Tuple: [embeddings, h0, h1, ..., hL-1]
+
         result: Dict[str, jnp.ndarray] = {}
         for layer in self.config.layer_indices:
-            tensor = hidden_states[layer + 1]  # offset past the embedding slot
-            result[f"h{layer}"] = jnp.asarray(
-                tensor.detach().to("cpu").float().numpy()
-            )
+            # offset past token embedding output (index 0)
+            result[f"h{layer}"] = hidden_states[layer + 1]
+
         return result
 
 
 # ---------------------------------------------------------------------------
-# Registry: theta_0 lives outside the JAX/Optax trainable tree.
+# Registry: theta_0 parameters live outside the JAX/Optax trainable tree.
 # ---------------------------------------------------------------------------
 
 _REGISTRY: Dict[str, FrozenBase] = {}
 
 
 def get_base(config: BaseModelConfig) -> FrozenBase:
-    """Return the cached :class:`FrozenBase` for ``config`` (one instance).
-
-    The base model weights are registered here, keyed by the frozen config, so
-    multiple ``FrozenLLMExtension`` graph nodes can share a single loaded
-    substrate without duplicating weights.
-    """
+    """Return the cached :class:`FrozenBase` for ``config`` (singleton)."""
     key = str(config)
     if key not in _REGISTRY:
         _REGISTRY[key] = FrozenBase(config)
