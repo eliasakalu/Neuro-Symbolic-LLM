@@ -1,9 +1,9 @@
 """Frozen-LLM + FabricPC continuous residual stack (research plan Stage A3).
 
 Public API:
-    - ``setup_env``        : configure JAX/XLA before importing JAX.
-    - ``FrozenLLMExtension``: host-side bridge (frozen torch base + graph).
-    - ``BaseModelConfig``  : frozen base config (``"tiny-gpt2"`` = offline).
+    - ``setup_env``         : configure JAX/XLA before importing JAX.
+    - ``FrozenLLMExtension``: host-side bridge (frozen Flax/JAX base + graph).
+    - ``BaseModelConfig``   : frozen base config (``"tiny-gpt2"`` = offline).
     - ``PCResidualConfig`` / ``build_pc_fabric``: build the residual graph.
     - ``train_step`` / ``retrain_predictors``: PC training + transfer.
     - ``fracture_index`` / ``entanglement_index``: internal KR metrics.
