@@ -11,7 +11,7 @@ with the Gaussian predictive energy of the research plan, Appendix A:
 Three FabricPC nodes are composed per layer:
 
   * ``h0_<l>`` :class:`IdentityNode` -- clamped to the *cached* frozen base
-    hidden state ``h0l`` (produced host-side by one torch forward per batch).
+    hidden state ``h0l`` (produced host-side by one JAX forward per batch).
     It is the static reference the residual settles against.
   * ``z_<l>``   :class:`PCResidualNode` -- the latent state ``z_l`` that the K
     PC inference iterations move. Its predictor ``f_phi`` reads ``h0l``; its
@@ -86,7 +86,6 @@ class PCResidualNode(NodeBase):
 
     @staticmethod
     def get_weight_fan_in(source_shape: Tuple[int, ...], config: Dict) -> int:
-        # f_phi is a per-position linear read: fan-in is the feature dim.
         return source_shape[-1]
 
     @staticmethod
