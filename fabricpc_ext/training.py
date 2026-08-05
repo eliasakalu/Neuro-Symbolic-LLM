@@ -14,7 +14,7 @@ latent targets ``z_l`` from a reference run, and retrain only the predictors
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -31,7 +31,7 @@ def get_graph_param_gradient(
     batch: Dict[str, jnp.ndarray],
     structure: GraphStructure,
     rng_key: jax.Array,
-) -> Tuple[GraphParams, float, GraphState]:
+) -> Tuple[GraphParams, jnp.ndarray, GraphState]:
     """Local weight gradients for a batch (single device, JIT-able).
 
     Mirrors ``fabricpc.training.train.get_graph_param_gradient``, but every
@@ -39,7 +39,11 @@ def get_graph_param_gradient(
     task-map lookup always fires and the base is never re-run.
     """
     batch_size = next(iter(batch.values())).shape[0]
-    clamps = {structure.task_map[k]: v for k, v in batch.items() if k in structure.task_map}
+    clamps = {
+        structure.task_map[k]: v
+        for k, v in batch.items()
+        if k in structure.task_map
+    }
 
     init_state = initialize_graph_state(
         structure, batch_size, rng_key, clamps=clamps, params=params
@@ -47,13 +51,13 @@ def get_graph_param_gradient(
     final_state = run_inference(params, init_state, clamps, structure)
 
     energy = sum(
-        sum(final_state.nodes[node_name].energy)
+        jnp.sum(final_state.nodes[node_name].energy)
         for node_name in structure.nodes
         if structure.nodes[node_name].node_info.in_degree > 0
     ) / batch_size
 
     grads = compute_local_weight_gradients(params, final_state, structure)
-    return grads, float(energy), final_state
+    return grads, energy, final_state
 
 
 def train_step(
@@ -64,8 +68,8 @@ def train_step(
     optimizer: optax.GradientTransformation,
     rng_key: jax.Array,
     *,
-    mask: Optional[Callable] = None,
-) -> Tuple[GraphParams, optax.OptState, float, GraphState]:
+    mask: Optional[Callable[[str], bool]] = None,
+) -> Tuple[GraphParams, optax.OptState, jnp.ndarray, GraphState]:
     """One PC training step: infer -> local gradients -> optimizer update.
 
     Args:
@@ -82,13 +86,19 @@ def train_step(
     return params, opt_state, energy, final_state
 
 
-def _apply_mask(grads: GraphParams, mask: Callable) -> GraphParams:
+def _apply_mask(grads: GraphParams, mask: Callable[[str], bool]) -> GraphParams:
     """Zero gradients on nodes the mask function rejects."""
 
-    def per_node(name, node_params):
+    def per_node(name: str, node_params):
         keep = mask(name)
-        weights = {k: (v if keep else jnp.zeros_like(v)) for k, v in node_params.weights.items()}
-        biases = {k: (v if keep else jnp.zeros_like(v)) for k, v in node_params.biases.items()}
+        weights = {
+            k: (v if keep else jnp.zeros_like(v))
+            for k, v in node_params.weights.items()
+        }
+        biases = {
+            k: (v if keep else jnp.zeros_like(v))
+            for k, v in node_params.biases.items()
+        }
         return type(node_params)(weights=weights, biases=biases)
 
     nodes = {
@@ -106,7 +116,7 @@ def predictor_only_mask(node_name: str) -> bool:
 def retrain_predictors(
     params: GraphParams,
     structure: GraphStructure,
-    new_base_batches: "object",
+    new_base_batches: Iterable[Dict[str, jnp.ndarray]],
     optimizer: optax.GradientTransformation,
     rng_key: jax.Array,
     num_steps: int = 1,
@@ -119,24 +129,17 @@ def retrain_predictors(
     research-plan transfer trick: PC separates state inference from weight
     learning, so the residual's learned latent targets can stay fixed while the
     predictor re-learns the read direction.
-
-    Args:
-        params: Current fabric parameters.
-        structure: Fabric graph.
-        new_base_batches: Iterable of batch dicts (cached new-base
-            activations, same clamp format as ``train_step``).
-        optimizer: Optax optimizer (e.g. ``optax.adam(1e-3)``).
-        rng_key: JAX PRNG key, split per step.
-        num_steps: Number of predictor-only update steps.
-
-    Returns:
-        Updated ``GraphParams`` with fresh predictor weights.
     """
     opt_state = optimizer.init(params)
     for batch in new_base_batches:
         key, rng_key = jax.random.split(rng_key)
         params, opt_state, _, _ = train_step(
-            params, opt_state, batch, structure, optimizer, key,
+            params,
+            opt_state,
+            batch,
+            structure,
+            optimizer,
+            key,
             mask=predictor_only_mask,
         )
         num_steps -= 1
