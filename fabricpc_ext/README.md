@@ -1,98 +1,499 @@
 # FabricPC Extension (`fabricpc_ext`)
 
-This folder contains the **Frozen-LLM + FabricPC Continuous Residual Stack**, implementing the integration of a completely frozen Large Language Model (LLM) base with a Predictive Coding (PC) residual fabric (FabricPC).
+> **Frozen Large Language Models meet Predictive Coding.**
+>
+> `fabricpc_ext` integrates a **completely frozen pretrained LLM** (e.g., GPT-2) with a **FabricPC continuous residual network**, allowing efficient downstream adaptation **without fine-tuning the base model** and **without backpropagating through the transformer**.
 
-## Overview
-The architecture is designed to augment a frozen pretrained LLM (like GPT-2) with a continuous, low-rank residual graph trained via Predictive Coding. This allows for adapting and tuning the model representations for downstream tasks without ever modifying the base model's weights or requiring backpropagation through time/layers of the massive LLM.
+---
 
-## How it Works
-1. **Activation Caching (One-Time Forward)**: The Frozen LLM (substrate) receives an input batch of tokens and runs exactly one forward pass using JAX/Flax. The hidden states $h_0^l$ for selected layers are cached. The base model parameters ($\theta_0$) never enter the trainable Optax tree.
-2. **Clamping to the Fabric**: The cached hidden states are mapped and clamped onto identity input nodes ($h0\_<l>$) in the FabricPC residual graph.
-3. **Iterative Inference (PC)**: For $K$ inference steps, the predictive coding fabric settles its continuous latent variables ($z_l$) by minimizing a Gaussian predictive energy function:
-   $$E = L_{task} + \frac{1}{2\sigma^2} || z_l - f_\phi(h_0^l) ||^2$$
-   Here, $f_\phi$ is a learned predictor predicting the latent state from the frozen hidden state.
-4. **Residual Write**: The settled latent state is transformed by a low-rank write matrix ($B_l$) and added back to the frozen hidden state to produce the final representation: $\tilde{h}^l = h_0^l + B_l z_l$.
-5. **Local Learning**: Weight gradients for the FabricPC nodes ($f_\phi$, $B_l$, and task heads) are computed locally based on the settled PC state, without backpropagating through the frozen base.
+# Overview
 
-## Components and Files
+Modern LLMs require enormous computational resources to fine-tune. This extension provides an alternative by keeping the pretrained transformer **100% frozen** while learning a lightweight **Predictive Coding (PC) residual fabric** that modifies the hidden representations locally.
 
-### `base_forward.py`
-**Purpose**: Hosts the static substrate of the residual stack.
-- Loads a pretrained GPT-2-style causal LM via Hugging Face Flax.
-- Defines `FrozenBase`, which runs one forward pass per batch and caches per-layer hidden states ($h_0^l$) as JAX arrays. 
-- These cached activations serve as static reference points for the PC residual fabric.
+Instead of updating billions of transformer parameters, the system learns a small residual graph that:
 
-### `frozen_llm_extension.py`
-**Purpose**: The host-side bridge that ties the frozen JAX base to the PC residual graph.
-- Defines `FrozenLLMExtension`, which owns the `FrozenBase`.
-- Implements `build_task_batch()`, which turns a batch of token IDs into a clamp dictionary consumed by the FabricPC graph, mapping the cached arrays onto the $h0\_<l>$ input nodes.
+- caches hidden representations from the frozen model
+- performs iterative predictive coding inference
+- writes learned residuals back into the hidden states
+- trains only the residual network and task head
 
-### `pc_residual.py`
-**Purpose**: Defines the continuous PC residual fabric built on FabricPC node primitives.
-- **`IdentityNode` ($h0\_<l>$)**: Clamped to the cached frozen base hidden state $h_0^l$.
-- **`PCResidualNode` ($z\_<l>$)**: Represents the latent state $z_l$. Its predictor $f_\phi$ reads $h_0^l$. It minimizes local predictive energy. The $K$ PC inference iterations dynamically update its latent state.
-- **`LinearResidual` ($out\_<l>$)**: The write node that computes $\tilde{h}^l = B_l z_l + h_0^l$.
-- Constructs the full graph structure and maps the topology via `build_pc_fabric()`.
+The pretrained LLM never changes.
 
-### `training.py`
-**Purpose**: Handles the training loops and parameter updates for the FabricPC graph.
-- **`train_step`**: Wraps the stock FabricPC machinery (inference $\rightarrow$ local gradients $\rightarrow$ optimizer update).
-- **`retrain_predictors` (Predictor-only retraining)**: Facilitates transfer learning when the base model is changed. It freezes the write matrices ($B_l$) and task head, and retrains *only* the predictors ($f_\phi$) in the $z\_<l>$ nodes against the new base activations.
+---
 
-### `metrics.py`
-**Purpose**: Contains internal Knowledge Representation (KR) metrics, specifically computing the fracture index and entanglement index to analyze the residual modifications.
+# Architecture
 
-### `env.py`
-**Purpose**: Environment setup to configure JAX/XLA backend settings prior to importing JAX.
+```
+                  Input Tokens
+                       │
+                       ▼
+         Frozen Pretrained LLM (GPT-2)
+        (One Forward Pass • No Gradients)
+                       │
+             Cached Hidden States
+                 h0[layer]
+                       │
+                       ▼
+        FabricPC Continuous Residual Graph
+      ┌────────────────────────────────────┐
+      │ Identity Nodes                     │
+      │ Predictive Coding Nodes            │
+      │ Residual Write Nodes               │
+      └────────────────────────────────────┘
+                       │
+          Iterative PC Inference
+               (K inference steps)
+                       │
+                       ▼
+        Residual Hidden Representation
+               h̃[layer]
+                       │
+                       ▼
+                Downstream Task
+```
 
-### `__init__.py`
-**Purpose**: Exposes the public API for the module.
+---
 
-## Iterative Process (PC Inference)
-In a standard deep learning model, a forward pass is instantaneous. In this FabricPC implementation, the forward pass involves an **iterative relaxation process**:
-1. The frozen hidden states $h_0^l$ are clamped.
-2. The network runs for `infer_steps` (e.g., $K=4$).
-3. At each step, the latent variables $z_l$ dynamically update themselves by following the gradient of the local energy functional (trying to match the prediction $f_\phi(h_0^l)$ and any top-down task signals).
-4. Once the latent states settle, the final residual $\tilde{h}^l$ is computed and passed to the task head.
+# Key Features
 
-## How to Run / Use
-You can utilize the `FrozenLLMExtension` to bridge a model and train it using standard JAX/Optax paradigms wrapped by FabricPC. 
+- ✅ Frozen pretrained transformer
+- ✅ No backpropagation through the LLM
+- ✅ Local Predictive Coding learning
+- ✅ Low-rank residual adaptation
+- ✅ Modular FabricPC implementation
+- ✅ JAX + Flax implementation
+- ✅ Hugging Face model support
+- ✅ Lightweight transfer learning
+
+---
+
+# Learning Pipeline
+
+The extension performs five stages during training.
+
+## 1. Frozen Forward Pass
+
+The pretrained language model performs **exactly one forward pass**.
+
+For every selected transformer layer, the hidden representation is cached.
+
+```
+h0[layer]
+```
+
+These cached activations become the fixed inputs to the FabricPC graph.
+
+The pretrained model parameters remain frozen throughout training.
+
+---
+
+## 2. Clamp Cached Activations
+
+Each cached hidden state is connected to an Identity Node inside the FabricPC graph.
+
+```
+Cached Hidden State
+        │
+        ▼
+ IdentityNode(h0_layer)
+```
+
+These values remain fixed during the iterative inference process.
+
+---
+
+## 3. Predictive Coding Inference
+
+Instead of performing a conventional neural network forward pass, the residual graph performs **iterative inference**.
+
+For every inference iteration:
+
+- latent variables are updated
+- prediction errors are minimized
+- representations gradually converge
+
+The predictive coding objective is
+
+```text
+Energy =
+TaskLoss
++ (1 / (2σ²))
+× || z[layer] − Predictor(h0[layer]) ||²
+```
+
+where
+
+- `TaskLoss` is the downstream objective
+- `Predictor()` predicts the latent state
+- `z[layer]` is the latent PC representation
+
+---
+
+## 4. Residual Writing
+
+After convergence, the learned latent representation is projected back into the frozen hidden state.
+
+```text
+ResidualHidden =
+FrozenHidden
++
+WriteMatrix × LatentState
+```
+
+or
+
+```text
+h̃[layer] = h0[layer] + B[layer] × z[layer]
+```
+
+This produces the updated hidden representation used for downstream prediction.
+
+---
+
+## 5. Local Learning
+
+Only FabricPC parameters are updated.
+
+Trainable components include
+
+- predictor networks
+- residual write matrices
+- task heads
+
+The pretrained transformer remains untouched.
+
+---
+
+# Directory Structure
+
+```
+fabricpc_ext/
+│
+├── __init__.py
+├── env.py
+├── metrics.py
+├── base_forward.py
+├── frozen_llm_extension.py
+├── pc_residual.py
+└── training.py
+```
+
+---
+
+# File Descriptions
+
+## base_forward.py
+
+Responsible for the frozen transformer.
+
+Responsibilities
+
+- loads pretrained Hugging Face Flax models
+- performs one forward pass
+- caches hidden representations
+- never computes gradients
+
+Output
+
+```
+Hidden States
+↓
+
+h0[layer]
+```
+
+---
+
+## frozen_llm_extension.py
+
+Acts as the bridge between the frozen model and FabricPC.
+
+Responsibilities
+
+- owns the frozen model
+- builds FabricPC graph
+- converts token batches into clamp dictionaries
+- connects cached activations to Identity Nodes
+
+---
+
+## pc_residual.py
+
+Implements the complete Predictive Coding residual graph.
+
+Contains
+
+### IdentityNode
+
+Stores cached hidden representations.
+
+```
+h0[layer]
+```
+
+---
+
+### PCResidualNode
+
+Represents the latent predictive coding state.
+
+```
+z[layer]
+```
+
+Responsibilities
+
+- predictor network
+- latent state update
+- local predictive coding inference
+
+---
+
+### LinearResidual
+
+Writes the learned residual back into the frozen hidden representation.
+
+```
+h̃[layer]
+=
+h0[layer]
++
+B[layer] × z[layer]
+```
+
+---
+
+## training.py
+
+Contains the training algorithms.
+
+### train_step()
+
+Runs
+
+```
+Frozen Forward Pass
+        │
+        ▼
+Clamp Hidden States
+        │
+        ▼
+Predictive Coding Inference
+        │
+        ▼
+Local Gradient Computation
+        │
+        ▼
+Optimizer Update
+```
+
+---
+
+### retrain_predictors()
+
+Useful when changing the frozen pretrained model.
+
+Only predictor networks are retrained.
+
+Frozen
+
+- residual write matrices
+- task head
+- pretrained transformer
+
+Trainable
+
+- predictor networks
+
+---
+
+## metrics.py
+
+Provides Knowledge Representation metrics.
+
+Includes
+
+- Fracture Index
+- Entanglement Index
+
+These metrics measure how the residual network changes the internal representation.
+
+---
+
+## env.py
+
+Configures
+
+- JAX
+- XLA
+- runtime environment
+
+before importing JAX.
+
+---
+
+# Iterative Predictive Coding
+
+Unlike a standard transformer, FabricPC performs iterative inference.
+
+```
+Cached Hidden States
+        │
+        ▼
+Inference Step 1
+        │
+        ▼
+Inference Step 2
+        │
+        ▼
+Inference Step 3
+        │
+        ▼
+...
+        │
+        ▼
+Inference Step K
+        │
+        ▼
+Residual Output
+```
+
+Each iteration reduces the predictive coding energy until convergence.
+
+---
+
+# Example
 
 ```python
 import jax
+import jax.numpy as jnp
 import optax
-from fabricpc_ext import BaseModelConfig, PCResidualConfig, FrozenLLMExtension, train_step
+import time
+from transformers import AutoTokenizer
 
-# 1. Configure the frozen base and the PC residual fabric
-base_config = BaseModelConfig(model_id="tiny-gpt2", layer_indices=(0,))
-fabric_config = PCResidualConfig(
-    seq_len=base_config.max_seq_len, 
-    hidden_size=base_config.hidden_size,
-    num_classes=10
+from fabricpc_ext import (
+    BaseModelConfig,
+    PCResidualConfig,
+    FrozenLLMExtension,
+    train_step,
 )
 
-# 2. Initialize the extension (loads model & builds graph)
-extension = FrozenLLMExtension(base_config, fabric_config)
-graph_structure = extension.structure
-params = graph_structure.params # Initialized node parameters
+print("1. Configuring frozen model and residual graph...")
+base_config = BaseModelConfig(
+    model_id="tiny-gpt2",
+    layer_indices=(0,),
+    max_seq_len=16, # Short sequence length for this example
+)
 
-# 3. Setup Optimizer
+fabric_config = PCResidualConfig(
+    seq_len=base_config.max_seq_len,
+    hidden_size=base_config.hidden_size,
+    num_classes=10,
+    infer_steps=4,  # 4 iterations of PC inference
+)
+
+print("2. Loading the model and initializing FabricPC extension...")
+start_time = time.time()
+# This loads the HuggingFace model (or tiny-gpt2) and builds the residual graph
+extension = FrozenLLMExtension(
+    base_config,
+    fabric_config,
+)
+print(f"   Done in {time.time() - start_time:.2f}s")
+
+graph = extension.structure
+params = graph.params
+
 optimizer = optax.adam(1e-3)
 opt_state = optimizer.init(params)
 
-# 4. Training Loop
-# Assuming `token_ids` and `labels` are your JAX arrays for a batch
-batch_dict = extension.build_task_batch(token_ids, labels)
-rng_key = jax.random.PRNGKey(42)
+print("3. Preparing real text data (Shakespeare)...")
+# Using a real tokenizer instead of random dummy integers!
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
 
-# Run one train step (Inference + Local Weight Update)
-params, opt_state, energy, state = train_step(
-    params=params,
-    opt_state=opt_state,
-    batch=batch_dict,
-    structure=graph_structure,
-    optimizer=optimizer,
-    rng_key=rng_key
+texts = [
+    "To be, or not to be, that is the question:",
+    "All the world's a stage, and all the men and women merely players;"
+]
+
+# Tokenize the text into integer IDs that the model understands
+inputs = tokenizer(
+    texts, 
+    return_tensors="np", 
+    max_length=base_config.max_seq_len, 
+    padding="max_length", 
+    truncation=True
 )
-print(f"Energy: {energy}")
+token_ids = jnp.array(inputs["input_ids"])
+print(f"   Token IDs shape: {token_ids.shape}")
+
+# Generate dummy labels (e.g., zero vectors for a classification task)
+# In a real scenario, these would be your actual target labels!
+labels = jnp.zeros((len(texts), 10))
+
+print("4. Caching frozen base activations...")
+# The base model runs exactly once here to cache activations and clamp them
+batch = extension.build_task_batch(
+    token_ids,
+    labels,
+)
+
+print("5. Starting training loop (PC inference + local updates)...")
+rng = jax.random.PRNGKey(42)
+num_epochs = 5
+for epoch in range(num_epochs):
+    rng, step_rng = jax.random.split(rng)
+    
+    # train_step performs the K steps of PC inference internally and then updates weights
+    params, opt_state, energy, state = train_step(
+        params=params,
+        opt_state=opt_state,
+        batch=batch,
+        structure=graph,
+        optimizer=optimizer,
+        rng_key=step_rng,
+    )
+    
+    print(f"   Step {epoch + 1}/{num_epochs} - Predictive Energy: {energy:.4f}")
+
+print("Training complete!")
 ```
+
+---
+
+# Advantages
+
+Compared to conventional fine-tuning
+
+| Feature | Full Fine-Tuning | FabricPC Extension |
+|----------|------------------|--------------------|
+| Updates Transformer | ✅ | ❌ |
+| Requires Backprop Through LLM | ✅ | ❌ |
+| Frozen Base Model | ❌ | ✅ |
+| Local Learning | ❌ | ✅ |
+| Lightweight Adaptation | ❌ | ✅ |
+| Easy Transfer Learning | ⚠️ | ✅ |
+
+---
+
+# Requirements
+
+- Python 3.10+
+- JAX
+- Flax
+- Optax
+- Hugging Face Transformers
+- FabricPC
+
+---
+
+# Citation
+
+If you use this extension in your research, please cite the corresponding FabricPC and Frozen-LLM publications.
+
+---
+
+# License
+
+This module follows the same license as the parent **Neuro-Symbolic-LLM** project.
