@@ -864,7 +864,7 @@ pip install -U -e ".[all]"
 Install the required Hugging Face libraries:
 
 ```bash
-pip install transformers flax
+        pip install transformers flax
 ```
 
 ## Running the Example

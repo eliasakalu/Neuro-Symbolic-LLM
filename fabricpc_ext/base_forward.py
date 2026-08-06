@@ -18,7 +18,7 @@ from typing import Dict, Any, Tuple
 
 import jax
 import jax.numpy as jnp
-from transformers import FlaxGPT2Config, FlaxGPT2Model
+from transformers import GPT2Config, FlaxGPT2Model
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class BaseModelConfig:
 
 def _build_tiny_model(config: BaseModelConfig, prng_key: jax.Array) -> FlaxGPT2Model:
     """Construct a small random GPT-2 for offline JAX/Flax runs."""
-    flax_config = FlaxGPT2Config(
+    flax_config = GPT2Config(
         vocab_size=config.vocab_size,
         n_positions=config.max_seq_len,
         n_ctx=config.max_seq_len,
