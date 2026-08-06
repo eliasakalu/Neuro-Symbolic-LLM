@@ -1,3 +1,14 @@
-env/
-venv/
-.venv/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cextensions
+*.so
+
+# Distribution / packaging metadata
+*.egg-info/
+.eggs/
+dist/
+build/__pycache__/
+*.egg-info/

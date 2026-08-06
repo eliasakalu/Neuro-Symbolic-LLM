@@ -43,7 +43,7 @@ class FlaxGPT2Attention(nn.Module):
         # Scaled dot-product attention
         attn_weights = jnp.matmul(q, k.swapaxes(-1, -2)) / jnp.sqrt(head_dim)
         if mask is not None:
-            attn_weights = jnp.where(mask == 0, -1e9, attn_weights)
+            attn_weights = jnp.where(mask == 0, -1e4, attn_weights)
         attn_probs = jax.nn.softmax(attn_weights, axis=-1)
         attn_out = jnp.matmul(attn_probs, v)
 
@@ -125,7 +125,7 @@ class BaseModelConfig:
 
     model_id: str = "tiny-gpt2"
     layer_indices: Tuple[int, ...] = (0,)
-    vocab_size: int = 256
+    vocab_size: int = 50257
     max_seq_len: int = 32
     hidden_size: int = 64
     num_layers: int = 2

@@ -36,25 +36,57 @@ from fabricpc.core.initializers import MuPCInitializer, NormalInitializer
 from fabricpc.core.activations import IdentityActivation
 from fabricpc.core.energy import GaussianEnergy
 from fabricpc.core.mupc import MuPCConfig
-try:
-    from fabricpc.core.topology import Edge
-except ImportError:
-    try:
-        from fabricpc.graph_assembly.graph_construction import Edge
-    except ImportError:
-        try:
-            from fabricpc.core.types import Edge
-        except ImportError:
-            from fabricpc.graph_assembly import Edge
+from fabricpc.core.topology import Edge
+from fabricpc.core.types import NodeParams, NodeState
 
-from fabricpc.core.types import NodeParams, NodeState, NodeInfo
-from fabricpc.nodes.base import NodeBase, SlotSpec
-from fabricpc.nodes.identity import IdentityNode
-from fabricpc.nodes.linear import Linear
-from fabricpc.nodes.linear_residual import LinearResidual
-from fabricpc.nodes.pooling import AvgPool
-from fabricpc.graph_assembly.graph_construction import graph, TaskMap
-from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
+from fabricpc.nodes import (
+    NodeBase,
+    SlotSpec,
+    IdentityNode,
+    Linear,
+    LinearResidual,
+)
+from fabricpc.graph_assembly import graph, TaskMap
+from fabricpc.graph_initialization import FeedforwardStateInit
+
+
+class AvgPool(NodeBase):
+    """Global average pooling node over the sequence dimension (axis 1)."""
+
+    def __init__(
+        self,
+        shape: Tuple[int, ...],
+        name: str,
+        global_pool: bool = True,
+        activation=None,
+        energy=None,
+    ):
+        super().__init__(
+            shape=shape,
+            name=name,
+            activation=activation or IdentityActivation(),
+            energy=energy or GaussianEnergy(),
+            latent_init=NormalInitializer(),
+            weight_init=None,
+        )
+        self.global_pool = global_pool
+
+    @staticmethod
+    def get_slots() -> Dict[str, SlotSpec]:
+        return {"in": SlotSpec(name="in", is_multi_input=False)}
+
+    @staticmethod
+    def initialize_params(key, node_shape, input_shapes, weight_init, config=None):
+        return NodeParams(weights={}, biases={})
+
+    @staticmethod
+    def forward(params, inputs, state, node_info) -> NodeState:
+        x = next(iter(inputs.values()))
+        z_mu = jnp.mean(x, axis=1) if x.ndim > 2 else x
+        error = state.z_latent - z_mu
+        state = state._replace(z_mu=z_mu, error=error)
+        state = node_info.node_class.energy_functional(state, node_info)
+        return state
 
 
 class PCResidualNode(NodeBase):
