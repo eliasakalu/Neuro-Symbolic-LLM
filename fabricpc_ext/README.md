@@ -844,11 +844,42 @@ Compared to conventional fine-tuning
 # Requirements
 
 - Python 3.10+
-- JAX
-- Flax
-- Optax
+- JAX, Flax, Optax
 - Hugging Face Transformers
 - FabricPC
+
+## Installation
+
+Make sure you have `fabricpc` installed. If you haven't installed it, clone its repository and run the appropriate installation command for your system:
+
+```bash
+# GPU, CUDA 13
+pip install -U -e ".[all,cuda13]"
+# GPU, CUDA 12
+pip install -U -e ".[all,cuda12]"
+# CPU only
+pip install -U -e ".[all]"
+```
+
+Install the required Hugging Face libraries:
+
+```bash
+pip install transformers flax
+```
+
+## Running the Example
+
+If you run `python example.py` directly from inside the `fabricpc_ext/` directory, you will likely get a `ModuleNotFoundError: No module named 'fabricpc_ext'`. This happens because Python doesn't automatically add the parent directory to its path.
+
+To run the example successfully, **execute it from the root of the repository** (e.g., inside the `Neuro-Symbolic-LLM` directory):
+
+```bash
+python -m fabricpc_ext.example
+```
+*or*
+```bash
+python fabricpc_ext/example.py
+```
 
 ---
 
