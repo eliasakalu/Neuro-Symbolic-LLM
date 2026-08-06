@@ -36,7 +36,17 @@ from fabricpc.core.initializers import MuPCInitializer, NormalInitializer
 from fabricpc.core.activations import IdentityActivation
 from fabricpc.core.energy import GaussianEnergy
 from fabricpc.core.mupc import MuPCConfig
-from fabricpc.core.topology import Edge
+try:
+    from fabricpc.core.topology import Edge
+except ImportError:
+    try:
+        from fabricpc.graph_assembly.graph_construction import Edge
+    except ImportError:
+        try:
+            from fabricpc.core.types import Edge
+        except ImportError:
+            from fabricpc.graph_assembly import Edge
+
 from fabricpc.core.types import NodeParams, NodeState, NodeInfo
 from fabricpc.nodes.base import NodeBase, SlotSpec
 from fabricpc.nodes.identity import IdentityNode
