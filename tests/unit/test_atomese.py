@@ -80,6 +80,7 @@ class TestParseAtom:
             "(UsedFor knife cutting)",
             "(Before dawn sunrise)",
             "(After sunrise dawn)",
+            "(Not (On cat chair))",
         ]
         for expr in cases:
             a = parse_atom(expr)
@@ -146,6 +147,7 @@ class TestValidate:
             "(UsedFor knife cutting)",
             "(Before dawn sunrise)",
             "(After sunrise dawn)",
+            "(Not (On cat chair))",
         ]
         for expr in cases:
             ok, err = validate_metta_string(expr)
@@ -160,6 +162,23 @@ class TestValidate:
 
         assert not ok
         assert "requires exactly 2" in err
+
+    def test_not_requires_exactly_one_complete_fact(self):
+        ok, err = validate_metta_string("(Not (On cat chair))")
+        assert ok, err
+
+        ok, err = validate_metta_string("(Not cat)")
+        assert not ok
+        assert "complete link atom" in err
+
+        ok, err = validate_metta_string("(Not (On cat chair) extra)")
+        assert not ok
+        assert "requires exactly 1" in err
+
+    def test_nested_fact_is_validated(self):
+        ok, err = validate_metta_string("(Not (Unknown cat chair))")
+        assert not ok
+        assert "Unknown predicate" in err
 
 
 # ── match_template ────────────────────────────────────────────────────────────

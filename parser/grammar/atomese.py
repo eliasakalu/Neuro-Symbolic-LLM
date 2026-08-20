@@ -10,12 +10,12 @@ What lives here:
   - Atom data classes (SymbolAtom, LinkAtom)
   - parse_atom():          string → Atom tree
   - atom_to_string():      Atom tree → string
-  - validate_metta_string(): is this valid for our 8-predicate vocabulary?
+  - validate_metta_string(): is this valid for our closed vocabulary?
   - match_template():      does this ground atom match this template?
   - generalize():          produce a template from a ground atom
   - canonical():           normalize a string for deduplication
 
-The 14 predicates we use (closed vocabulary):
+The 15 predicates we use (closed vocabulary):
   Inheritance  "X is a type of Y"           (Inheritance dog animal)
   Evaluation   "X does Y to Z"              (Evaluation likes (List john mary))
   CanDo        "X can do Y"                 (CanDo bird fly)
@@ -29,6 +29,7 @@ The 14 predicates we use (closed vocabulary):
   UsedFor      "X is used for Y"            (UsedFor knife cutting)
   Before       "X happens before Y"         (Before dawn sunrise)
   After        "X happens after Y"          (After sunrise dawn)
+  Not          "fact X is explicitly negated" (Not (On cat chair))
   List         argument list for Evaluation (List john mary)
 """
 
@@ -55,6 +56,7 @@ PREDICATES = frozenset(
         "UsedFor",
         "Before",
         "After",
+        "Not",
     }
 )
 
@@ -73,6 +75,7 @@ ARITY = {
     "Before": 2,
     "After": 2,
     "Evaluation": 2,  # (Evaluation VERB ARGS)
+    "Not": 1,
     # List: variable arity (1–4)
 }
 
@@ -203,7 +206,7 @@ def atom_to_string(atom: Atom) -> str:
 
 
 def validate_metta_string(s: str) -> tuple[bool, str]:
-    """Check whether a string is valid MeTTa for our 8-predicate vocabulary.
+    """Check whether a string is valid MeTTa for our closed vocabulary.
 
     Returns (is_valid: bool, error_message: str).
     error_message is empty string when is_valid is True.
@@ -235,6 +238,11 @@ def validate_metta_string(s: str) -> tuple[bool, str]:
     if not isinstance(atom, LinkAtom):
         return False, "Top-level atom must be a link (start with '(')"
 
+    return _validate_link(atom)
+
+
+def _validate_link(atom: LinkAtom) -> tuple[bool, str]:
+    """Validate one link and every nested link it contains."""
     if atom.predicate not in PREDICATES:
         return False, (
             f"Unknown predicate '{atom.predicate}'. "
@@ -252,6 +260,15 @@ def validate_metta_string(s: str) -> tuple[bool, str]:
     elif atom.predicate == "List":
         if len(atom.children) < 1:
             return False, "List requires at least 1 child"
+
+    if atom.predicate == "Not" and not isinstance(atom.children[0], LinkAtom):
+        return False, "'Not' requires a complete link atom as its child"
+
+    for child in atom.children:
+        if isinstance(child, LinkAtom):
+            is_valid, error = _validate_link(child)
+            if not is_valid:
+                return False, error
 
     return True, ""
 
