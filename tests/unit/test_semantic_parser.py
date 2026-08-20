@@ -94,6 +94,11 @@ class TestReferenceSemanticParser:
         result = parser.parse("A car was bought by Ben.")
         assert str(result[0]) == "(Evaluation buy (List ben car))"
 
+    def test_returns_negated_fact(self):
+        parser, _ = make_teacher("(Not (On Cat Chair))")
+        result = parser.parse("The cat is not on the chair.")
+        assert str(result[0]) == "(Not (On cat chair))"
+
     def test_removes_code_fence(self):
         parser, _ = make_teacher("```metta\n(Has dog fur)\n```")
         assert str(parser.parse("A dog has fur.")[0]) == "(Has dog fur)"
