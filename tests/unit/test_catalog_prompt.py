@@ -37,6 +37,18 @@ def test_prompt_preserves_source_text_and_semantic_rules() -> None:
     assert "extracted-hypothesis" in prompt.text
 
 
+def test_prompt_uses_only_selected_ontology_modules() -> None:
+    catalog = load_ontology_catalog(modules=("upper", "discourse"))
+
+    prompt = build_catalog_document_prompt(
+        "Mira left despite the rain.", catalog=catalog
+    )
+
+    assert "Concession(statement: Clause, counter_statement: Clause)" in prompt.text
+    assert "Kick(" not in prompt.text
+    assert "lexical-v1" not in prompt.text
+
+
 def test_prompt_rejects_empty_source_text() -> None:
     with pytest.raises(ValueError, match="source_text"):
         build_catalog_document_prompt(" \t ", catalog=load_ontology_catalog())

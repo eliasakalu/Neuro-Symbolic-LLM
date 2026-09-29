@@ -33,6 +33,27 @@ def test_loads_versioned_catalog_with_explicit_types() -> None:
     assert "OpenObligation" not in catalog.types
 
 
+def test_selects_only_requested_modules_and_records_their_versions() -> None:
+    catalog = load_ontology_catalog(modules=("discourse", "upper"))
+
+    assert catalog.versions == ("discourse-v1", "upper-v1")
+    assert catalog.signatures()["Concession"] == (
+        frozenset({"Clause"}),
+        frozenset({"Clause"}),
+    )
+    assert "Kick" not in catalog.relations
+    assert "Fold" not in catalog.relations
+
+
+def test_requires_available_modules_and_declared_argument_types() -> None:
+    with pytest.raises(OntologyCatalogError, match="Unknown ontology modules"):
+        load_ontology_catalog(modules=("upper", "missing"))
+    with pytest.raises(OntologyCatalogError, match="contains duplicates"):
+        load_ontology_catalog(modules=("upper", "upper"))
+    with pytest.raises(OntologyCatalogError, match="declares no types"):
+        load_ontology_catalog(modules=("discourse",))
+
+
 def test_exports_ordered_immutable_type_signatures() -> None:
     catalog = load_ontology_catalog()
 

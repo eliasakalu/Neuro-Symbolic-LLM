@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -196,8 +196,10 @@ def _parse_relation(
     )
 
 
-def load_ontology_catalog(directory: Path | None = None) -> OntologyCatalog:
-    """Load, merge, and validate every ontology YAML module in a directory."""
+def load_ontology_catalog(
+    directory: Path | None = None, *, modules: Iterable[str] | None = None
+) -> OntologyCatalog:
+    """Load a complete catalog or an explicitly selected set of modules."""
 
     catalog_directory = directory or default_catalog_directory()
     paths = sorted(catalog_directory.glob("*.yaml"))
@@ -205,6 +207,19 @@ def load_ontology_catalog(directory: Path | None = None) -> OntologyCatalog:
         raise OntologyCatalogError(
             f"No ontology YAML files found in {catalog_directory}"
         )
+    if modules is not None:
+        selected = tuple(modules)
+        if not selected or any(
+            not isinstance(name, str) or not name.strip() for name in selected
+        ):
+            raise OntologyCatalogError("Ontology module selection cannot be empty")
+        if len(set(selected)) != len(selected):
+            raise OntologyCatalogError("Ontology module selection contains duplicates")
+        available = {path.stem: path for path in paths}
+        unknown = set(selected) - available.keys()
+        if unknown:
+            raise OntologyCatalogError(f"Unknown ontology modules {sorted(unknown)}")
+        paths = sorted(available[name] for name in selected)
 
     versions: list[str] = []
     declared_types: set[str] = set()
