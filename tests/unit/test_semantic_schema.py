@@ -24,6 +24,7 @@ def valid_result_data() -> dict[str, Any]:
                 ],
                 "fallback": True,
                 "polarity": "positive",
+                "factuality": "asserted",
                 "confidence": 0.98,
                 "source_span": "Ben bought a car.",
                 "alternatives": [],
@@ -36,23 +37,70 @@ def test_accepts_the_structured_output_contract() -> None:
     result = SemanticParseResult.model_validate(valid_result_data())
 
     assertion = result.assertions[0]
+
     assert assertion.predicate == "Evaluation"
     assert assertion.arguments[0].role == "agent"
+    assert assertion.factuality == "asserted"
     assert assertion.confidence == 0.98
 
 
 def test_applies_safe_optional_defaults() -> None:
     data = valid_result_data()
     assertion = data["assertions"][0]
+
     del assertion["fallback"]
     del assertion["polarity"]
+    del assertion["factuality"]
     del assertion["alternatives"]
 
     result = SemanticParseResult.model_validate(data)
 
-    assert result.assertions[0].fallback is False
-    assert result.assertions[0].polarity == "positive"
-    assert result.assertions[0].alternatives == []
+    assertion = result.assertions[0]
+
+    assert assertion.fallback is False
+    assert assertion.polarity == "positive"
+    assert assertion.factuality == "asserted"
+    assert assertion.alternatives == []
+
+
+@pytest.mark.parametrize(
+    "factuality",
+    [
+        "asserted",
+        "opinion",
+        "speculative",
+        "hypothetical",
+    ],
+)
+def test_accepts_supported_factuality_values(
+    factuality: str,
+) -> None:
+    data = valid_result_data()
+    data["assertions"][0]["factuality"] = factuality
+
+    result = SemanticParseResult.model_validate(data)
+
+    assert result.assertions[0].factuality == factuality
+
+
+@pytest.mark.parametrize(
+    "factuality",
+    [
+        "fact",
+        "uncertain",
+        "possible",
+        "conditional",
+        "",
+    ],
+)
+def test_rejects_unknown_factuality(
+    factuality: str,
+) -> None:
+    data = valid_result_data()
+    data["assertions"][0]["factuality"] = factuality
+
+    with pytest.raises(ValidationError):
+        SemanticParseResult.model_validate(data)
 
 
 @pytest.mark.parametrize("confidence", [-0.01, 1.01])
@@ -76,7 +124,6 @@ def test_rejects_unknown_polarity() -> None:
     ("field", "value"),
     [
         ("predicate", ""),
-        ("arguments", []),
         ("source_span", ""),
     ],
 )
@@ -91,6 +138,33 @@ def test_rejects_empty_required_assertion_values(
         SemanticParseResult.model_validate(data)
 
 
+def test_allows_empty_arguments_for_evaluation() -> None:
+    data = valid_result_data()
+    assertion = data["assertions"][0]
+
+    assertion["predicate"] = "Evaluation"
+    assertion["relation"] = "rain"
+    assertion["arguments"] = []
+    assertion["fallback"] = True
+
+    result = SemanticParseResult.model_validate(data)
+
+    assert result.assertions[0].arguments == []
+
+
+def test_rejects_empty_arguments_for_non_evaluation() -> None:
+    data = valid_result_data()
+    assertion = data["assertions"][0]
+
+    assertion["predicate"] = "Has"
+    assertion["relation"] = None
+    assertion["arguments"] = []
+    assertion["fallback"] = False
+
+    with pytest.raises(ValidationError):
+        SemanticParseResult.model_validate(data)
+
+
 def test_rejects_empty_assertion_collection() -> None:
     with pytest.raises(ValidationError):
         SemanticParseResult.model_validate({"assertions": []})
@@ -99,10 +173,13 @@ def test_rejects_empty_assertion_collection() -> None:
 @pytest.mark.parametrize("level", ["result", "assertion", "argument"])
 def test_rejects_extra_fields_at_every_level(level: str) -> None:
     data = valid_result_data()
+
     if level == "result":
         data["unexpected"] = "value"
+
     elif level == "assertion":
         data["assertions"][0]["unexpected"] = "value"
+
     else:
         data["assertions"][0]["arguments"][0]["unexpected"] = "value"
 
@@ -117,15 +194,18 @@ def known_predicate_result(
     roles: tuple[str, ...] = ("owner", "possessed"),
     fallback: bool = False,
 ) -> SemanticParseResult:
-    """Return structured output for predicate-specific validation tests."""
+    """Return structured output for predicate validation tests."""
     data = valid_result_data()
+
     assertion = data["assertions"][0]
+
     assertion["predicate"] = predicate
     assertion["relation"] = relation
     assertion["arguments"] = [
         {"value": f"value_{index}", "role": role} for index, role in enumerate(roles)
     ]
     assertion["fallback"] = fallback
+
     return SemanticParseResult.model_validate(data)
 
 
@@ -197,3 +277,76 @@ def test_rejects_evaluation_without_relation() -> None:
 
     with pytest.raises(SemanticParseError, match="requires a relation"):
         ReferenceSemanticParser.validate_predicates(result)
+
+
+def test_repairs_known_predicate_contract() -> None:
+    result = known_predicate_result(
+        predicate="UsedFor",
+        relation="cut",
+        roles=("entity", "purpose"),
+        fallback=True,
+    )
+
+    repaired = ReferenceSemanticParser.repair_known_predicate_contract(result)
+
+    assertion = repaired.assertions[0]
+
+    assert assertion.predicate == "UsedFor"
+    assert assertion.relation is None
+    assert assertion.fallback is False
+
+    # Original model output is not mutated.
+    assert result.assertions[0].relation == "cut"
+    assert result.assertions[0].fallback is True
+
+    assert ReferenceSemanticParser.validate_predicates(repaired) is repaired
+    assert ReferenceSemanticParser.validate_arguments(repaired) is repaired
+
+
+def test_repairs_contract_for_any_known_predicate() -> None:
+    result = known_predicate_result(
+        predicate="Contains",
+        relation="contain",
+        roles=("container", "contained"),
+        fallback=True,
+    )
+
+    repaired = ReferenceSemanticParser.repair_known_predicate_contract(result)
+
+    assertion = repaired.assertions[0]
+
+    assert assertion.relation is None
+    assert assertion.fallback is False
+
+    assert ReferenceSemanticParser.validate_predicates(repaired) is repaired
+    assert ReferenceSemanticParser.validate_arguments(repaired) is repaired
+
+
+def test_negative_speculative_assertion_preserves_both_dimensions() -> None:
+    data = valid_result_data()
+
+    assertion = data["assertions"][0]
+    assertion["polarity"] = "negative"
+    assertion["factuality"] = "speculative"
+
+    result = SemanticParseResult.model_validate(data)
+
+    assertion = result.assertions[0]
+
+    assert assertion.polarity == "negative"
+    assert assertion.factuality == "speculative"
+
+
+def test_negative_hypothetical_assertion_preserves_both_dimensions() -> None:
+    data = valid_result_data()
+
+    assertion = data["assertions"][0]
+    assertion["polarity"] = "negative"
+    assertion["factuality"] = "hypothetical"
+
+    result = SemanticParseResult.model_validate(data)
+
+    assertion = result.assertions[0]
+
+    assert assertion.polarity == "negative"
+    assert assertion.factuality == "hypothetical"

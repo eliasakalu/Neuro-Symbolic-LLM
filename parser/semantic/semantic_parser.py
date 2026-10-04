@@ -89,7 +89,7 @@ def _load_predicate_schemas() -> dict[str, dict[str, object]]:
         if schema.get("variable_arity") is True:
             minimum = schema.get("min_arity")
             maximum = schema.get("max_arity")
-            if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 1:
+            if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 0:
                 raise ValueError(f"Invalid min_arity for {name!r}")
             if maximum is not None and (
                 not isinstance(maximum, int)
@@ -217,6 +217,114 @@ class _BaseSemanticParser:
         return clean_model_output(output)
 
     @staticmethod
+    def repair_known_predicate_contract(
+        result: SemanticParseResult,
+    ) -> SemanticParseResult:
+        """Repair deterministic contract fields for known predicates."""
+        repaired = result.model_copy(deep=True)
+
+        for assertion in repaired.assertions:
+            if (
+                assertion.predicate in PREDICATE_SCHEMAS
+                and assertion.predicate != "Evaluation"
+            ):
+                assertion.relation = None
+                assertion.fallback = False
+
+        return repaired
+
+    @staticmethod
+    def repair_ambiguous_pronouns(
+        result: SemanticParseResult,
+    ) -> SemanticParseResult:
+        """Remove unresolved referential pronouns while preserving expletive 'it'."""
+        repaired = result.model_copy(deep=True)
+
+        pronouns = {
+            "he",
+            "she",
+            "it",
+            "they",
+            "him",
+            "her",
+            "them",
+        }
+
+        expletive_it_relations = {
+            "rain",
+            "snow",
+            "hail",
+            "drizzle",
+            "thunder",
+        }
+
+        repaired_assertions = []
+
+        for assertion in repaired.assertions:
+            filtered_arguments = []
+
+            for argument in assertion.arguments:
+                value = argument.value.casefold()
+
+                # Preserve non-pronouns normally.
+                if value not in pronouns:
+                    filtered_arguments.append(argument)
+                    continue
+
+                # "It" can be a non-referential dummy subject in weather events.
+                #
+                # Example:
+                #   "It rains."
+                #
+                # Here "it" is not ambiguous coreference, so do not remove it.
+                if (
+                    value == "it"
+                    and assertion.predicate == "Evaluation"
+                    and assertion.relation is not None
+                    and assertion.relation.casefold() in expletive_it_relations
+                ):
+                    filtered_arguments.append(argument)
+                    continue
+
+                # Otherwise the raw pronoun is unresolved and is removed.
+
+            # No unresolved referential pronoun was removed.
+            if len(filtered_arguments) == len(assertion.arguments):
+                repaired_assertions.append(assertion)
+                continue
+
+            # If every semantic argument was removed, this assertion cannot
+            # currently be represented safely.
+            if not filtered_arguments:
+                continue
+
+            assertion.arguments = filtered_arguments
+
+            # A fixed-arity known predicate that loses a required participant
+            # becomes incomplete, so drop that assertion rather than guessing.
+            if assertion.predicate != "Evaluation":
+                schema = PREDICATE_SCHEMAS.get(assertion.predicate)
+
+                if isinstance(schema, dict):
+                    expected_arity = schema.get("arity")
+
+                    if (
+                        isinstance(expected_arity, int)
+                        and len(assertion.arguments) != expected_arity
+                    ):
+                        continue
+
+            repaired_assertions.append(assertion)
+
+        if not repaired_assertions:
+            raise SemanticParseError(
+                "No grounded assertions remain after unresolved pronoun repair"
+            )
+
+        repaired.assertions = repaired_assertions
+        return repaired
+
+    @staticmethod
     def validate_predicates(result: SemanticParseResult) -> SemanticParseResult:
         """Validate predicate and fallback consistency."""
         for assertion in result.assertions:
@@ -249,7 +357,7 @@ class _BaseSemanticParser:
             actual_arity = len(assertion.arguments)
             if schema.get("variable_arity") is True:
                 minimum, maximum = schema.get("min_arity"), schema.get("max_arity")
-                if not isinstance(minimum, int) or minimum < 1:
+                if not isinstance(minimum, int) or minimum < 0:
                     raise ValueError(f"Invalid min_arity for {assertion.predicate!r}")
                 if maximum is not None and (
                     not isinstance(maximum, int) or maximum < minimum
@@ -282,6 +390,35 @@ class _BaseSemanticParser:
                     f"{assertion.predicate} requires argument roles "
                     f"{expected_roles!r}, got {actual_roles!r}"
                 )
+        return result
+
+    @staticmethod
+    def validate_source_spans(
+        result: SemanticParseResult,
+        sentence: str,
+        context: str = "",
+    ) -> SemanticParseResult:
+        """Ensure every source span is grounded in the supplied text."""
+        source_text = " ".join(
+            part.strip() for part in (context, sentence) if part.strip()
+        )
+
+        if not source_text:
+            raise SemanticParseError("Source text cannot be empty")
+
+        source_text_normalized = " ".join(source_text.split()).casefold()
+
+        for assertion in result.assertions:
+            span = " ".join(assertion.source_span.split()).strip()
+
+            if not span:
+                raise SemanticParseError("source_span cannot be empty")
+
+            if span.casefold() not in source_text_normalized:
+                raise SemanticParseError(
+                    f"source_span is not supported by the input text: {span!r}"
+                )
+
         return result
 
     @staticmethod
@@ -372,6 +509,8 @@ class _BaseSemanticParser:
             raise SemanticParseError(f"Normalization failed: {error}") from error
 
         # 3. Validate predicates and arguments
+        result = self.repair_ambiguous_pronouns(result)
+        result = self.repair_known_predicate_contract(result)
         result = self.validate_predicates(result)
         result = self.validate_arguments(result)
 
@@ -428,9 +567,15 @@ class _BaseSemanticParser:
             )
         except SemanticNormalizationError as error:
             raise SemanticParseError(str(error)) from error
-
+        result = self.repair_ambiguous_pronouns(result)
+        result = self.repair_known_predicate_contract(result)
         result = self.validate_predicates(result)
         result = self.validate_arguments(result)
+        result = self.validate_source_spans(
+            result,
+            sentence=normalized_sentence,
+            context=context,
+        )
         return result
 
     def parse(
