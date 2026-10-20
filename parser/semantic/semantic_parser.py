@@ -11,6 +11,7 @@ Both share the same validation, normalization, and rendering pipeline.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +38,6 @@ from parser.semantic.normalization import (
     SemanticNormalizationError,
     normalize_semantic_result,
 )
-from parser.semantic.output_cleanup import clean_model_output
 from parser.semantic.schema import SemanticParseResult
 from parser.student.student_prompt import build_student_prompt
 
@@ -137,6 +137,20 @@ def _build_predicate_guide() -> str:
 
 PREDICATE_GUIDE = _build_predicate_guide()
 
+_CODE_FENCE_RE = re.compile(
+    r"^```(?:json)?\s*(.*?)\s*```$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _iter_all_assertions(result: SemanticParseResult):
+    """Yield standalone assertions and assertions contained in rules."""
+    yield from result.assertions
+
+    for rule in result.rules:
+        yield from rule.antecedents
+        yield from rule.consequents
+
 
 @dataclass(frozen=True, slots=True)
 class SemanticParserConfig:
@@ -175,7 +189,7 @@ class _BaseSemanticParser:
         model: Any = None,
         tokenizer: Any = None,
     ) -> None:
-        """Create a parser with either a backend or a loaded model."""
+        """Create a parser with either backend or a loaded model."""
         self._backend = backend
         self._config = config
         self._model = model
@@ -213,8 +227,38 @@ class _BaseSemanticParser:
 
     @staticmethod
     def clean_model_output(output: str) -> str:
-        """Remove whitespace and one optional JSON Markdown code fence."""
-        return clean_model_output(output)
+        """Clean model output and extract a JSON object when possible."""
+        cleaned = output.strip()
+
+        # Case 1: Remove an optional Markdown JSON code fence.
+        match = _CODE_FENCE_RE.fullmatch(cleaned)
+        if match:
+            cleaned = match.group(1).strip()
+
+        # Case 2: Output is already valid JSON.
+        try:
+            json.loads(cleaned)
+            return cleaned
+        except json.JSONDecodeError:
+            pass
+
+        # Case 3: Extract JSON preceded by explanatory text.
+        decoder = json.JSONDecoder()
+
+        for index, character in enumerate(cleaned):
+            if character != "{":
+                continue
+
+            try:
+                obj, _ = decoder.raw_decode(cleaned[index:])
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(obj, dict):
+                return json.dumps(obj)
+
+        # Leave invalid output unchanged so validation reports the error.
+        return cleaned
 
     @staticmethod
     def repair_known_predicate_contract(
@@ -223,7 +267,7 @@ class _BaseSemanticParser:
         """Repair deterministic contract fields for known predicates."""
         repaired = result.model_copy(deep=True)
 
-        for assertion in repaired.assertions:
+        for assertion in _iter_all_assertions(repaired):
             if (
                 assertion.predicate in PREDICATE_SCHEMAS
                 and assertion.predicate != "Evaluation"
@@ -237,7 +281,17 @@ class _BaseSemanticParser:
     def repair_ambiguous_pronouns(
         result: SemanticParseResult,
     ) -> SemanticParseResult:
-        """Remove unresolved referential pronouns while preserving expletive 'it'."""
+        """Repair or remove unresolved referential pronouns safely.
+
+        Standalone assertions preserve the existing behavior: unresolved
+        referential pronouns are removed when possible.
+
+        Inside rules, a pronoun may be resolved only when the rule has exactly
+        one clear generic participant such as ``someone``, ``something``, or a
+        MeTTa variable. Otherwise the rule is rejected rather than guessed.
+
+        Expletive ``it`` in weather expressions is preserved.
+        """
         repaired = result.model_copy(deep=True)
 
         pronouns = {
@@ -258,6 +312,15 @@ class _BaseSemanticParser:
             "thunder",
         }
 
+        def is_expletive_it(assertion, value: str) -> bool:
+            return (
+                value == "it"
+                and assertion.predicate == "Evaluation"
+                and assertion.relation is not None
+                and assertion.relation.casefold() in expletive_it_relations
+            )
+
+        # Preserve the existing standalone-assertion behavior.
         repaired_assertions = []
 
         for assertion in repaired.assertions:
@@ -266,42 +329,25 @@ class _BaseSemanticParser:
             for argument in assertion.arguments:
                 value = argument.value.casefold()
 
-                # Preserve non-pronouns normally.
                 if value not in pronouns:
                     filtered_arguments.append(argument)
                     continue
 
-                # "It" can be a non-referential dummy subject in weather events.
-                #
-                # Example:
-                #   "It rains."
-                #
-                # Here "it" is not ambiguous coreference, so do not remove it.
-                if (
-                    value == "it"
-                    and assertion.predicate == "Evaluation"
-                    and assertion.relation is not None
-                    and assertion.relation.casefold() in expletive_it_relations
-                ):
+                if is_expletive_it(assertion, value):
                     filtered_arguments.append(argument)
                     continue
 
                 # Otherwise the raw pronoun is unresolved and is removed.
 
-            # No unresolved referential pronoun was removed.
             if len(filtered_arguments) == len(assertion.arguments):
                 repaired_assertions.append(assertion)
                 continue
 
-            # If every semantic argument was removed, this assertion cannot
-            # currently be represented safely.
             if not filtered_arguments:
                 continue
 
             assertion.arguments = filtered_arguments
 
-            # A fixed-arity known predicate that loses a required participant
-            # becomes incomplete, so drop that assertion rather than guessing.
             if assertion.predicate != "Evaluation":
                 schema = PREDICATE_SCHEMAS.get(assertion.predicate)
 
@@ -316,18 +362,60 @@ class _BaseSemanticParser:
 
             repaired_assertions.append(assertion)
 
-        if not repaired_assertions:
+        # If standalone repair would remove every assertion and there are no rules,
+        # fail before assigning an invalid empty state to the Pydantic model.
+        if not repaired_assertions and not repaired.rules:
             raise SemanticParseError(
                 "No grounded assertions remain after unresolved pronoun repair"
             )
 
         repaired.assertions = repaired_assertions
+
+        # Repair pronouns inside rules.
+        for rule in repaired.rules:
+            generic_candidates = set()
+
+            for assertion in rule.antecedents:
+                for argument in assertion.arguments:
+                    value = argument.value
+
+                    if value.startswith("$") or value.casefold() in {
+                        "someone",
+                        "something",
+                    }:
+                        generic_candidates.add(value)
+
+            replacement = (
+                next(iter(generic_candidates)) if len(generic_candidates) == 1 else None
+            )
+
+            for assertion in [
+                *rule.antecedents,
+                *rule.consequents,
+            ]:
+                for argument in assertion.arguments:
+                    value = argument.value.casefold()
+
+                    if value not in pronouns:
+                        continue
+
+                    if is_expletive_it(assertion, value):
+                        continue
+
+                    if replacement is None:
+                        raise SemanticParseError(
+                            "Unresolved pronoun inside conditional rule: "
+                            f"{argument.value!r}"
+                        )
+
+                    argument.value = replacement
+
         return repaired
 
     @staticmethod
     def validate_predicates(result: SemanticParseResult) -> SemanticParseResult:
         """Validate predicate and fallback consistency."""
-        for assertion in result.assertions:
+        for assertion in _iter_all_assertions(result):
             predicate = assertion.predicate
             if predicate not in PREDICATE_SCHEMAS:
                 raise SemanticParseError(f"Unknown semantic predicate: {predicate!r}")
@@ -348,7 +436,7 @@ class _BaseSemanticParser:
     @staticmethod
     def validate_arguments(result: SemanticParseResult) -> SemanticParseResult:
         """Validate assertion argument counts against the YAML schema."""
-        for assertion in result.assertions:
+        for assertion in _iter_all_assertions(result):
             schema = PREDICATE_SCHEMAS.get(assertion.predicate)
             if not isinstance(schema, dict):
                 raise SemanticParseError(
@@ -393,6 +481,90 @@ class _BaseSemanticParser:
         return result
 
     @staticmethod
+    def repair_rule_duplication(
+        result: SemanticParseResult,
+    ) -> SemanticParseResult:
+        """Remove standalone assertions redundantly emitted with rules.
+
+        Exact duplicates are always removed.
+
+        Also remove a hypothetical standalone assertion when:
+        - it contains a MeTTa variable;
+        - that variable also occurs inside a rule; and
+        - its source span is contained within that rule's source span.
+
+        This handles redundant universal-rule output such as emitting both
+        PropertyOf($x, rough) and the rule
+        PropertyOf($x, smart) -> PropertyOf($x, rough),
+        without attempting broader semantic rewriting.
+        """
+        if not result.rules or not result.assertions:
+            return result
+
+        repaired = result.model_copy(deep=True)
+
+        rule_assertions = {
+            assertion.model_dump_json()
+            for rule in repaired.rules
+            for assertion in [
+                *rule.antecedents,
+                *rule.consequents,
+            ]
+        }
+
+        def assertion_variables(assertion) -> set[str]:
+            return {
+                argument.value
+                for argument in assertion.arguments
+                if argument.value.startswith("$")
+            }
+
+        rule_metadata = []
+
+        for rule in repaired.rules:
+            variables = {
+                variable
+                for assertion in [
+                    *rule.antecedents,
+                    *rule.consequents,
+                ]
+                for variable in assertion_variables(assertion)
+            }
+
+            rule_span = " ".join(rule.source_span.split()).casefold()
+
+            rule_metadata.append((variables, rule_span))
+
+        kept_assertions = []
+
+        for assertion in repaired.assertions:
+            if assertion.model_dump_json() in rule_assertions:
+                continue
+
+            assertion_vars = assertion_variables(assertion)
+
+            assertion_span = " ".join(assertion.source_span.split()).casefold()
+
+            redundant_rule_assertion = False
+
+            if assertion.factuality == "hypothetical" and assertion_vars:
+                for rule_vars, rule_span in rule_metadata:
+                    if (
+                        assertion_vars & rule_vars
+                        and assertion_span
+                        and assertion_span in rule_span
+                    ):
+                        redundant_rule_assertion = True
+                        break
+
+            if not redundant_rule_assertion:
+                kept_assertions.append(assertion)
+
+        repaired.assertions = kept_assertions
+
+        return repaired
+
+    @staticmethod
     def validate_source_spans(
         result: SemanticParseResult,
         sentence: str,
@@ -408,7 +580,7 @@ class _BaseSemanticParser:
 
         source_text_normalized = " ".join(source_text.split()).casefold()
 
-        for assertion in result.assertions:
+        for assertion in _iter_all_assertions(result):
             span = " ".join(assertion.source_span.split()).strip()
 
             if not span:
@@ -417,6 +589,17 @@ class _BaseSemanticParser:
             if span.casefold() not in source_text_normalized:
                 raise SemanticParseError(
                     f"source_span is not supported by the input text: {span!r}"
+                )
+
+        for rule in result.rules:
+            span = " ".join(rule.source_span.split()).strip()
+
+            if not span:
+                raise SemanticParseError("rule source_span cannot be empty")
+
+            if span.casefold() not in source_text_normalized:
+                raise SemanticParseError(
+                    f"rule source_span is not supported by the input text: {span!r}"
                 )
 
         return result
@@ -513,6 +696,7 @@ class _BaseSemanticParser:
         result = self.repair_known_predicate_contract(result)
         result = self.validate_predicates(result)
         result = self.validate_arguments(result)
+        result = self.repair_rule_duplication(result)
 
         # 4. Render to MeTTa
         try:
@@ -556,7 +740,7 @@ class _BaseSemanticParser:
             result = SemanticParseResult.model_validate_json(cleaned)
         except ValidationError as error:
             raise SemanticParseError(
-                "The model returned invalid structured semantic output"
+                f"The model returned invalid structured semantic output:{error}"
             ) from error
 
         try:
@@ -571,11 +755,13 @@ class _BaseSemanticParser:
         result = self.repair_known_predicate_contract(result)
         result = self.validate_predicates(result)
         result = self.validate_arguments(result)
+        result = self.repair_rule_duplication(result)
         result = self.validate_source_spans(
             result,
             sentence=normalized_sentence,
             context=context,
         )
+
         return result
 
     def parse(
