@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping
+from copy import deepcopy
+from typing import Any
 
 from parser.semantic.schema import SemanticAssertion, SemanticParseResult
 
@@ -21,6 +23,55 @@ _TEMPORAL_ROLES = {
 
 class SemanticNormalizationError(ValueError):
     """Raised when semantic values cannot be normalized safely."""
+
+
+def normalize_document_target(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize representation tokens without rewriting evidence or identity.
+
+    Catalog names and enum values allow surrounding whitespace cleanup only.
+    Entity IDs, references, quotations, alternatives, and provisional relation
+    identifiers remain exact. In particular, this does not merge aliases,
+    reorder arguments, infer factuality, or repair an incorrect entity type.
+    """
+    normalized = deepcopy(payload)
+    entities = normalized.get("entities")
+    assertions = normalized.get("assertions")
+    if not isinstance(entities, list) or not isinstance(assertions, list):
+        raise SemanticNormalizationError(
+            "Document entities and assertions must be lists"
+        )
+    for entity in entities:
+        if isinstance(entity, dict) and isinstance(entity.get("type"), str):
+            entity["type"] = entity["type"].strip()
+    all_assertions = [*assertions]
+    rules = normalized.get("rules", [])
+    if not isinstance(rules, list):
+        raise SemanticNormalizationError("Document rules must be a list")
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        variables = rule.get("variables", [])
+        if isinstance(variables, list):
+            for variable in variables:
+                if isinstance(variable, dict) and isinstance(variable.get("type"), str):
+                    variable["type"] = variable["type"].strip()
+        for side in ("antecedents", "consequents"):
+            if isinstance(rule.get(side), list):
+                all_assertions.extend(rule[side])
+    for assertion in all_assertions:
+        if not isinstance(assertion, dict):
+            continue
+        for field in ("predicate", "status", "factuality", "polarity"):
+            if isinstance(assertion.get(field), str):
+                assertion[field] = assertion[field].strip()
+        types = assertion.get("argument_types")
+        if isinstance(types, list):
+            assertion["argument_types"] = [
+                value.strip() if isinstance(value, str) else value for value in types
+            ]
+        # Absence denotes no explicit condition reference, never a guessed one.
+        assertion.setdefault("conditional_on", None)
+    return normalized
 
 
 def _normalize_phrase(value: str, field: str) -> str:
