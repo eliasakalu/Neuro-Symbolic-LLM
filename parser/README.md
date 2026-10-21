@@ -1,243 +1,351 @@
-# Neuro-Symbolic LLM
+# Semantic parser
 
-Natural-language text to validated MeTTa Atomese, with configurable hosted and
-local model backends. The current implementation includes the semantic-parser
-foundation, Atomese grammar, offline dataset generation, and unit tests.
+One extraction target, `semantic-document-v1`, is used for teacher annotation,
+student supervision, and inference. The parser produces typed, source-grounded
+documents; Hybrid Miner consumes those documents and the exported ontology
+definitions. Rendering MeTTa is a downstream operation, not a second LLM task.
 
-## Overview
+## Pipeline
 
 ```text
-Input:  Ben bought a car.
-Model target: {"assertions": [{"predicate": "Evaluation", "relation": "buy", ...}]}
-Derived MeTTa: (Evaluation buy (List Ben car))
+UTF-8 sentence file / dataset manifest / identified source records
+    -> configured teacher or document-trained student
+    -> catalog prompt + worked examples + optional constrained decoding
+    -> representation normalization + exact quotation anchoring
+    -> SemanticDocument + catalog validation
+       |-> accepted document JSONL and explicit rejected-record JSONL
+       |-> optional student pairs, from the same validated model response
+       |-> exact ontology bundle for the miner
+    -> independent miner ingestion -> emission/admission -> pattern mining
 ```
 
+The teacher and student use the same target, prompt construction, active
+ontology, source anchoring, and acceptance checks. They differ in model weights
+and provider provenance. A model request generates the entities, assertions and
+rules; deterministic code supplies source identity, parser provenance and
+numeric offsets.
 
-[`ReferenceSemanticParser`](./parser/semantic/semantic_parser.py) uses a larger model to make validated examples for
-offline distillation. [`DistilledSemanticParser`](./parser/semantic/semantic_parser.py) uses the same validation path
-with a future fine-tuned 1B–3B local model for deployment.
+### Target and compatibility
 
-## Architecture
+`ReferenceSemanticParser.parse()` and `DistilledSemanticParser.parse()` return
+`SemanticDocument`. `parse_document()` additionally accepts caller-assigned
+document and corpus IDs. `build-dataset` and `export-documents` invoke the same
+export function; neither selects an old assertion/rule extraction target.
 
-### End-to-end teacher–student flow
+`SemanticParseResult` remains a display/API representation for the existing
+renderer and a reader for historical records. It is not independently generated,
+a second dataset target, or a lossless miner interchange. Specifically:
 
-```mermaid
-flowchart TD
-    subgraph offline["Offline reference and dataset stage"]
-        source["Natural-language sentence<br/>Ben bought a sports car."]
-        teacher["ReferenceSemanticParser<br/>large teacher model"]
-        json["Structured JSON<br/>Evaluation · buy · Ben · sports car"]
-        schema["Pydantic validation<br/>confidence 0.98 ✓"]
-        normalize["Semantic normalization<br/>sports car → sports_car"]
-        validate["Semantic validation<br/>Evaluation · 2 args · fallback ✓"]
-        render["Deterministic rendering<br/>(Evaluation buy (List Ben sports_car))"]
-        atom["Validated LinkAtom<br/>Evaluation with List children"]
-        dataset[("Distillation JSONL<br/>text → structured JSON")]
-        rejected[("Rejected JSONL<br/>input + validation error")]
+- `generate_structured()` first generates a document, then derives a view.
+- `compatibility.document_to_legacy_result()` makes that projection without any
+  model call. Lexical arguments pass through the existing symbol normalization.
+- `read_legacy_result()` validates saved old-format records without inference.
+- `parse --format metta` renders a derived view. It does not replace the
+  provenance-bearing JSONL or the miner's emitter.
+- Old role/value labels cannot be converted into grounded document labels
+  without recovering and auditing information they do not contain.
 
-        source --> teacher --> json --> schema --> normalize --> validate
-        validate --> render --> atom
-        atom --> dataset
-        schema -. invalid .-> rejected
-        validate -. invalid .-> rejected
-        render -. invalid .-> rejected
-    end
+Empty accepted documents remain possible when no relation is supported.
+An empty compatibility view has no atoms to render.
 
-    subgraph deployment["Deployment stage"]
-        input["Natural-language sentence"]
-        student["DistilledSemanticParser<br/>local student model"]
-        student_json["Structured JSON"]
-        shared["Same validation, normalization,<br/>rendering, and Atomese pipeline"]
-        result["Validated LinkAtom"]
+This is an API migration, not a drop-in replacement for every historical call.
+Previously `parse()` returned rendered atoms; it now returns the canonical
+document. Call `generate_structured()` for the derived compatibility view or
+use `parse --format metta` for rendering. Aliases affect that derived view only,
+not canonical source evidence or entity identity.
 
-        input --> student --> student_json --> shared --> result
-    end
+The convenience `parse(sentence, context=...)` and prompt helpers treat the exact
+`context + "\n" + sentence` as one source document. Context is therefore eligible
+for extraction, not reference-only background as in the historical template.
+Use `parse_document(source_text=..., document_id=..., corpus_id=...)` when the
+caller needs an explicit document boundary. Target-sentence-only extraction with
+separate reference-only context is not currently represented by this contract.
 
-    dataset -. "future fine-tuning" .-> student
-```
+### Schema authority
 
-### Parser component relationships
+The six independently versioned YAML catalogs in [ontology/](ontology/) define
+known predicates and their ordered, typed signatures. The
+[semantic-extraction manifest](ontology/bundles/semantic-extraction-v1.yaml)
+selects the active bundle; by default it includes all six modules. The model
+chooses relations within that supplied vocabulary. There is no autonomous
+catalog router or hard-coded upper/discourse-only selection.
 
-```mermaid
-flowchart TD
-    openai["OpenAI / compatible"] --> backend
-    anthropic["Anthropic"] --> backend
-    gemini["Gemini"] --> backend
-    ollama["Ollama"] --> backend
-    transformers["Transformers"] --> backend
+[Catalog loading](ontology/catalog.py) checks duplicate definitions, declared
+types, arities, confidence bounds, and module versions.
+[Bundle compilation](ontology/miner_bundle.py) exports these selected definitions
+as the generic miner `OntologyBundle` format. The miner does not supply or require
+these six project catalogs.
 
-    backend["ModelBackend<br/>generate(prompt, model)"]
-    backend --> reference["ReferenceSemanticParser"]
-    backend --> distilled["DistilledSemanticParser"]
+[predicate_schema.yaml](../configs/parser_config/predicate_schema.yaml) is
+an active prompt input, as well as the authority for historical result validation.
+Every predicate description is reused, with its ordered roles where applicable.
+It is not blindly merged into the known catalog vocabulary:
 
-    reference --> prompt["Prompt construction"]
-    distilled --> prompt
-    prompt --> structured["Structured JSON validation"]
-    structured --> normalization["Semantic normalization"]
-    normalization --> semantic["Predicate and role validation"]
-    semantic --> renderer["MeTTa renderer"]
-    renderer --> atomese["Atomese validation"]
-    atomese --> links["LinkAtom objects"]
-```
-
-### Component source map
-
-GitHub renders Mermaid diagrams securely, so navigation is provided through
-standard Markdown links:
-
-| Diagram component | Implementation |
+| Legacy definition | Treatment in the shared document prompt |
 | --- | --- |
-| Model backends and `ModelBackend` | [`backends.py`](./parser/semantic/backends.py) |
-| Reference and distilled parsers | [`semantic_parser.py`](./parser/semantic/semantic_parser.py) |
-| Prompt construction | [`parser_prompt.yaml`](./configs/parser_config/parser_prompt.yaml) |
-| Structured JSON and Pydantic validation | [`schema.py`](./parser/semantic/schema.py) |
-| Semantic normalization | [`normalization.py`](./parser/semantic/normalization.py) |
-| Predicate, arity, and role contract | [`predicate_schema.yaml`](./configs/parser_config/predicate_schema.yaml) |
-| Deterministic MeTTa rendering | [`metta_renderer.py`](./parser/semantic/metta_renderer.py) |
-| Atomese and `LinkAtom` validation | [`atomese.py`](./parser/grammar/atomese.py) |
-| Accepted and rejected JSONL records | [`dataset.py`](./parser/semantic/dataset.py) |
-| Command-line interface | [`cli.py`](./parser/semantic/cli.py) |
+| `Cause(cause, effect)` | Reviewed equivalent of `Causes(cause, effect)`; supplements its interpretation while catalog types and confidence bounds remain authoritative |
+| Other fixed-arity predicates, such as `Near` and `During` | Lexical and ordered-participant guidance; use `ProvisionalRelation` unless a suitable active catalog predicate preserves the meaning |
+| `Evaluation` | Reuse the fallback rationale, not the old role/value JSON shape or renderer-specific argument limits |
+| Operators and structural containers | Not additional world-relation predicates; conjunction, implication and polarity use the document's explicit rule structure |
 
-## Model configuration and running
+The prompt composer checks legacy arity against its ordered roles. A reviewed
+catalog equivalent must have the same arity and argument-role order; drift fails
+before model generation. A same-name collision without a reviewed equivalence
+also fails rather than assuming semantic identity. These checks detect signature
+drift; the equivalence itself remains a reviewed semantic decision.
 
-Copy [`.env.example`](./.env.example) to `.env` and add only the credentials you
-use. Model selection belongs in
-[`configs/parser_config/model_backend.yaml`](./configs/parser_config/model_backend.yaml).
-The active profile picks the default backend. You can override it for one
-command with `--profile`.
+A supported uncataloged relation retains a distinct provisional identifier and
+typed arguments. No legacy relation is automatically approved merely because it
+appears in `predicate_schema.yaml`. This preserves the paper's fixed, versioned
+vocabulary and provisional-relation boundary without discarding existing guidance.
 
-For example, a local Ollama default is configured as:
+### Prompt composition and decoding
 
-```yaml
-active: ollama
+[Catalog prompt construction](semantic/catalog_prompt.py) assembles:
 
-profiles:
-  ollama:
-    provider: ollama
-    model: qwen3:8b
+| Source | Responsibility |
+| --- | --- |
+| [catalog_document_prompt.yaml](../configs/parser_config/catalog_document_prompt.yaml) | Document output instructions, grounding, factuality, rules and provisional relations |
+| [parser_prompt.yaml](../configs/parser_config/parser_prompt.yaml), `shared_extraction_guidance` | Reused interpretation guidance: voice, roles, coreference, negation, modality, ellipsis and conditions |
+| [predicate_schema.yaml](../configs/parser_config/predicate_schema.yaml) | Every predicate description, checked ordered-role hints, and explicitly reviewed catalog equivalents; not extra known predicates |
+| Active ontology modules | Authoritative known signatures and confidence bounds |
+| [catalog_document_examples.jsonl](../configs/parser_config/catalog_document_examples.jsonl) | Worked typed, source-quoted document examples, including scoped rules |
+
+The full historical target-specific template in `parser_prompt.yaml` is not an
+active generation prompt. Its old output instructions cannot be appended to the
+document prompt: the two JSON shapes conflict. Useful target-neutral guidance
+is maintained explicitly in the shared section instead.
+
+Prompt provenance includes a SHA-256 fingerprint of the assembled instructions,
+examples and schema guidance, excluding the current source text. Changed
+guidance invalidates stale training pairs/checkpoints even if the configured
+prompt version was not changed.
+The parser's `prompt_version` accessor reports this same active identity without
+calling the model. The historical constructor version label is retained for
+source compatibility; it does not select or override another extraction prompt.
+
+The current composed prompt is `catalog-document-v13` plus that fingerprint.
+Previously generated documents retain their recorded provenance. Training pairs
+and checkpoints from an older prompt are deliberately not relabeled as current;
+new supervision must be generated or separately reviewed by the parser team.
+
+A prompt asks the model to follow the contract. Constrained decoding additionally
+restricts the token choices using the generated JSON schema. The
+[decoding schema](semantic/catalog_output_schema.py) is derived from the shared
+contract and catalog signatures: it constrains predicate names, arity, argument
+types and confidence ranges. It cannot establish semantic truth or correct
+coreference. Post-generation validation is still required.
+
+Ollama supports this JSON-schema request. `--require-structured-output` refuses
+a backend without that capability before generation. Omitting that flag permits
+post-validation-only use of other providers. The local Transformers student
+does not currently implement grammar-constrained decoding.
+
+### Normalization and evidence
+
+[Document preparation](semantic/catalog_document_parser.py) normalizes
+representation tokens, resolves source quotes, constructs the shared document,
+and validates its semantics. [Normalization](semantic/normalization.py) trims
+predicate/type/enum whitespace and materializes optional condition fields.
+It preserves source text, IDs, reference order, quoted evidence, alternatives,
+and provisional relation meaning. It never repairs a wrong type by guessing.
+
+[Source anchoring](semantic/catalog_source_anchors.py) maps an exact quote plus
+its occurrence number to an offset. For example, `left` in `Mira left.` becomes
+`[5,9)`. A quote not present in the source is rejected. Numeric span-bound
+validation alone cannot determine which repeated mention the model meant;
+the occurrence resolves that distinction.
+
+The old symbol normalizer still serves rendered views, including punctuation,
+Unicode, quantities and aliases. Applying lossy symbol normalization to
+canonical source evidence would corrupt offsets or merge distinct mentions.
+That is why document normalization and display-symbol normalization are
+different operations, not competing parser targets.
+
+### Shared validation and extracted rules
+
+The parser imports `SemanticDocument`, its rule types, and signature checks from
+the separately installed `hybrid-miner` package. These calls run in the parser
+process; they do not start PeTTa or mine anything.
+
+- Shared document validation checks structure, IDs/references, declared types,
+  source bounds, assertion status, condition references and rule-variable scope.
+- Signature checks compare predicates, arities and argument types with the
+  supplied definitions.
+- Parser-specific checks enforce exact quote anchoring, extraction factuality,
+  selected catalog confidence ranges and interpretation policy.
+- The independent miner validates its own input boundary when it later receives
+  exported files. Another producer need not use this parser.
+
+After emission, the miner's document-admission interface receives the original
+documents along with facts, metadata and provenance. It quarantines complete
+documents rather than stopping an otherwise valid batch. Its separate
+`document-admission-v1` selection JSON identifies accepted source documents and
+binds that selection to the artifacts. Pass it as `--admission` to the miner's
+exact-matching and candidate-record commands. This is a downstream admission
+receipt, not another LLM output target or a second parser path. The raw-graph
+mining interface does not require this extraction-specific contract.
+
+Document rules preserve explicit source implications with typed local variables,
+nonempty antecedents/consequents, polarity and quotation evidence. Variables
+cannot escape into standalone assertions or appear only in a consequent.
+Extracting a stated rule is not executing it or claiming an S2 deduction.
+
+Rule support is an engineering extension preserving useful existing-parser
+capability within the document contract, not a claim that every field is
+dictated verbatim by the papers. The installed miner release must expose these
+rule types and the corresponding declarative rule-graph support. Its emitter
+preserves rule scope, signed antecedents/consequents and source provenance;
+it does not execute the rules or emit their conclusions as unconditional facts.
+Mining yields structural fragments with complete source-rule context, not
+permission to execute a shortened implication. The rule-graph encoding is
+miner-owned interchange structure, not additional parser ontology vocabulary.
+
+## Installation and model configuration
+
+The miner-facing package requires Python 3.11 or newer:
+
+```powershell
+python -m pip install -e ".[miner,ollama]"
 ```
 
-For the local Ollama profile, start the server in one terminal:
+The `miner` dependency targets the independent repository's `v0.1.0` tag.
+That tag must actually exist and include the required contract before a clean
+installation or CI can resolve it. During unreleased coordinated development:
 
-```bash
-ollama serve
+```powershell
+python -m pip install -e ../hybrid-miner
 ```
 
-Then run the parser from another terminal. To use the active profile from the
-configuration file:
+Model providers and weights are configured in
+[model_backend.yaml](../configs/parser_config/model_backend.yaml).
+`--profile` precedes the subcommand. The `ollama_catalog` development profile
+uses Qwen3-8B, temperature zero, thinking disabled and a document-sized generation
+budget. Model scale alone does not establish teacher quality.
 
-```bash
-source .venv/bin/activate
-python -m pip install -e .
-python -m parser.semantic parse "A bird can fly."
+For a remote Ollama server accessed over SSH, keep the tunnel open and set the
+host in the terminal executing the parser:
+
+```powershell
+$env:OLLAMA_HOST = "http://127.0.0.1:11435"
 ```
 
-To explicitly use Ollama, place the global `--profile` option before the
-subcommand:
+Never commit credentials or environment-specific connection details.
 
-```bash
-python -m pip install -e ".[ollama]"
-python -m parser.semantic --profile ollama parse "A bird can fly."
+## Generate and inspect documents
+
+Accepted input formats:
+
+- UTF-8 text: one exact source sentence per line.
+- Dataset manifest JSONL: `{"text":"Mira left.","source_dataset":"pilot","source_domain":"narrative"}`.
+- Identified source JSONL: `{"document_id":"doc-1","corpus_id":"pilot","source_text":"Mira left."}`.
+
+For sentence/manifest records, IDs are deterministic source-text hashes;
+`--corpus-id` sets the default namespace. Manifest dataset/domain metadata is
+retained in student pairs. Identified records retain caller-supplied IDs.
+Duplicate source IDs are rejected rather than overwritten.
+
+Use fresh output names for each audited run:
+
+```powershell
+python -m parser.semantic --profile ollama_catalog build-dataset --input data/source.jsonl --output data/documents.jsonl --rejected-output data/rejected.jsonl --student-pairs-output data/student-pairs.jsonl --bundle-output data/ontology.bundle.json --require-structured-output
 ```
 
-To provide context for reference resolution:
+`export-documents` is an alternative command name for exactly this operation.
+The older `parser.semantic.catalog_document_cli` entry point delegates to the
+same implementation. `--output` always means documents; it never changes
+meaning to training pairs. All outputs must have distinct, unused paths.
 
-```bash
-python -m parser.semantic --profile ollama parse \
-  "It released a new phone." \
-  --context "Apple is a technology company."
+Inspect the source beside the document: participant identity/order, negation,
+factuality, conditional scope, rule restrictors and supported relations.
+Acceptance proves contract compliance, not complete or correct extraction.
+Rejected rows include their source line and reason; do not hide them from
+acceptance metrics.
+
+The bundle is a deterministic export of the selected vocabulary, not a model
+response or a second parse. Supply `documents.jsonl` and `ontology.bundle.json`
+to the independent miner's ingestion command. Generated experiment artifacts
+need not be committed.
+
+## Student data, training and inference
+
+The paired label is the normalized quote-based `entities/assertions/rules`
+payload that produced the document. Runtime IDs, model provenance and numeric
+offsets are supplied deterministically again at inference; they are not a
+second semantic prediction target. Pair provenance pins the teacher, prompt,
+ontology versions, input and contract.
+
+If labels were not saved during extraction, `convert-to-pairs` can reconstruct
+them from validated documents and checks exact document round-trip equivalence:
+
+```powershell
+python -m parser.semantic convert-to-pairs --input data/documents.jsonl --output data/student-pairs.jsonl
+python -m parser.semantic split-pairs --input data/student-pairs.jsonl --output-dir data/splits
+python -m parser.semantic train-student --train-file data/splits/train.jsonl --val-file data/splits/validation.jsonl --method lora
 ```
 
-To build a distillation dataset, create a UTF-8 text file containing one
-sentence per line, then run:
+[Dataset code](semantic/dataset.py) deduplicates input texts and checks that
+identical input text does not overlap between splits. This does not establish
+original-document-family separation. It also retains
+complete-target tokenization, EOS supervision, prompt masking and padding
+masking. Oversized or incompatible examples fail explicitly; no target is
+truncated and no invalid label is silently skipped.
 
-```bash
-python -m parser.semantic --profile ollama build-dataset \
-  --input sentences.txt \
-  --output data/semantic_dataset.jsonl \
-  --include-metta
+[Training](student/train.py) retains the existing LoRA/full optimization,
+gradient accumulation, validation and safe precision selection.
+[student_config.yaml](../configs/parser_config/student_config.yaml) now selects
+the document target, the bundle manifest and a 16,384-token budget. Its output
+directory is `models/semantic_document_parser`; existing legacy checkpoints
+are not overwritten by that default. An explicit training configuration can
+select other model/hardware settings, but not another semantic target.
+
+The existing `student_config.yaml` remains the sole default training
+configuration. Training, corpus preparation at scale and student-quality
+evaluation are separate operations; extraction/export does not execute them.
+
+After training:
+
+```powershell
+python -m parser.semantic distill --model-dir models/semantic_document_parser "Mira left."
+python -m parser.semantic --profile semantic_document_student export-documents --input data/source.jsonl --output data/student.documents.jsonl --rejected-output data/student.rejected.jsonl
 ```
 
-Rejected examples are written to `data/semantic_dataset.rejected.jsonl` unless
-`--rejected-output` specifies another path. If Ollama is selected, start its
-server with `ollama serve` first.
+Checkpoint target, prompt fingerprint and ontology versions are checked before
+loading weights. A checkpoint trained on a historical result target is not
+automatically compatible with the document target. Its evaluation results do
+not establish quality on a different output contract.
+Deployment claims require a trained document checkpoint and held-out
+semantic evaluation. Successful teacher generation does not establish that.
 
-In Python, use the factory instead of choosing provider classes manually:
+`e2e` composes extraction, text-deduplicated splitting, the existing trainer and
+document inference in a fresh explicit run directory. Its exact-target comparison
+is ID-sensitive, not a semantic-equivalence benchmark.
 
-```python
-from parser.semantic import build_reference_semantic_parser
+## Source map
 
-parser = build_reference_semantic_parser(profile_name="ollama")
-atoms = parser.parse("A bird can fly.")
-for atom in atoms:
-    print(atom)
+| File | Responsibility |
+| --- | --- |
+| [semantic_parser.py](semantic/semantic_parser.py) | Shared teacher/student document generation and historical reader |
+| [backends.py](semantic/backends.py), [model_config.py](semantic/model_config.py) | Existing model providers, profiles and local execution |
+| [output_cleanup.py](semantic/output_cleanup.py) | Response-envelope cleanup, not semantic repair |
+| [catalog_document_parser.py](semantic/catalog_document_parser.py) | Document preparation and compatibility constructor |
+| [catalog_document_export.py](semantic/catalog_document_export.py) | One streaming exporter for documents, labels, rejections and bundle |
+| [catalog_student.py](semantic/catalog_student.py) | Label reconstruction and checkpoint compatibility |
+| [compatibility.py](semantic/compatibility.py) | Derived legacy display/API projection only |
+| [schema.py](semantic/schema.py), [metta_renderer.py](semantic/metta_renderer.py) | Historical/result-view types and deterministic rendering |
+| [cli.py](semantic/cli.py) | Production command interface |
+| [student_prompt.py](student/student_prompt.py) | Same catalog prompt for student training/inference |
+
+## Verification
+
+Run regression coverage and then inspect actual provider output:
+
+```powershell
+python -m pytest tests/unit tests/integration/test_catalog_document_parser.py tests/integration/test_catalog_document_export.py tests/integration/test_catalog_bundle.py -q
 ```
 
-## Atomese output contract
-
-The closed vocabulary is defined in
-[`configs/parser_config/predicate_schema.yaml`](./configs/parser_config/predicate_schema.yaml)
-and enforced by
-[`parser/grammar/atomese.py`](./parser/grammar/atomese.py):
-
-```text
-Inheritance  Evaluation  CanDo  On  Cause  Has  PartOf  StateOf  List
-LocatedIn  MemberOf  UsedFor  Before  After  Not
-```
-
-The model outputs structured JSON rather than MeTTa. Pydantic validates the
-shape and confidence range, predicate-specific checks validate arity and roles,
-and deterministic code renders the result as MeTTa. Entity case is preserved;
-multiword symbols use underscores. `Evaluation` handles relations without a
-dedicated predicate, and `polarity: negative` renders as `Not`.
-
-## Repository structure
-
-```text
-configs/
-├── parser_config/
-│   ├── model_backend.yaml       # selected provider and model profiles
-│   ├── parser_prompt.yaml       # structured semantic-parser prompt
-│   └── predicate_schema.yaml    # predicate arity and role definitions
-├── tiers.yaml                   # tier configuration
-└── stage_A/                     # experiment configurations
-experiments/                     # Stage A experiment entry points
-parser/
-├── grammar/atomese.py           # Atomese model, parser, and validation
-└── semantic/
-    ├── backends.py              # provider adapters
-    ├── model_config.py          # YAML/.env backend factory
-    ├── schema.py                # Pydantic structured-output contract
-    ├── normalization.py         # deterministic semantic normalization
-    ├── metta_renderer.py        # structured JSON to validated MeTTa
-    ├── semantic_parser.py       # parser orchestration and roles
-    ├── cli.py                   # command-line behavior
-    ├── __main__.py              # minimal package launcher
-    ├── dataset.py               # accepted/rejected JSONL records
-    └── __init__.py              # public semantic-parser API
-tests/unit/                      # offline unit tests
-```
-
-## Testing
-
-Tests are necessary. They verify deterministic logic without calling a model
-provider: Atomese parsing and validation, prompt construction, output cleanup,
-error handling, dataset records, and model-profile selection.
-
-Run all offline tests:
-
-```bash
-python -m pytest tests/unit -v
-```
-
-Do not replace these with live API tests. Test provider integrations separately
-with a small, opt-in smoke test because they require credentials, network
-access, and may cost money.
-
-## Current implementation status
-
-Implemented: structured JSON extraction, Pydantic and predicate validation,
-normalization, deterministic MeTTa rendering, configurable provider adapters,
-reference/distilled parser roles, text-to-JSON dataset generation, offline unit
-tests, and command-line dataset generation. Student-model fine-tuning remains
-a separate future stage.
+Unit/integration tests cover deterministic behavior. The production commands above
+are the manual checks for live model behavior. Audit rejection reasons and source
+meaning separately from structural acceptance. Report inference/runtime settings,
+data, denominators and measured timings when comparing models; no speed or
+semantic-quality claim follows merely from passing tests.
