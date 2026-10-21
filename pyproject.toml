@@ -56,7 +56,11 @@ openai = ["openai>=1.0"]
 anthropic = ["anthropic>=0.25"]
 gemini = ["google-genai>=2.0.0"]
 ollama = ["ollama>=0.4"]
+miner = [
+    "hybrid-miner @ git+https://github.com/iCog-Labs-Dev/hybrid-miner.git@v0.1.0",
+]
 dev = [
+    "jsonschema>=4.18",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4.1",
@@ -69,9 +73,11 @@ dev = [
 
 [project.scripts]
 semantic-parser = "parser.semantic.cli:main"
+semantic-document-export = "parser.semantic.catalog_document_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+exclude = ["data*", "tests*", "docs*", "build*", "*.egg-info"]
 include = [
     "fabricpc_ext*",
     "nac*",
@@ -83,10 +89,12 @@ include = [
     "tiers*",
     "symbolic_pipeline*",
     "substrate*",
+    "configs.parser_config",
 ]
 
 [tool.setuptools.package-data]
-"parser.ontology" = ["*.yaml"]
+"parser.ontology" = ["*.yaml", "bundles/*.yaml"]
+"configs.parser_config" = ["*.yaml", "*.jsonl"]
 
 # ── Black ──────────────────────────────────────────────────────────────────
 [tool.black]
