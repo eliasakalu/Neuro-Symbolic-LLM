@@ -1,4 +1,46 @@
 parser:
+  shared_extraction_guidance: |
+    Interpret semantic roles from meaning, never from surface word order.
+    Active and passive descriptions of the same event preserve its participants;
+    an agentless passive does not license inventing an agent.
+    Preserve every explicitly stated core participant and each distinct event.
+    Do not replace an event with a persistent relation merely because it is
+    passive or has a lasting result. Select predicates by their declared meaning.
+    Resolve pronouns, shared subjects, and omitted arguments only when one
+    antecedent is unambiguously supported. Never guess from proximity alone.
+    Preserve other grounded propositions when one participant remains ambiguous.
+    Dummy weather subjects such as 'it' in 'it rains' are not participants.
+    Preserve numeric values, units, dates, and quantified noun phrases exactly;
+    do not invent conversions or discard a quantity to fit a predicate.
+    Temporal and spatial modifiers supplement rather than replace the core
+    event. Distinguish an event's location from an entity's persistent location.
+    A logical condition is neither a date nor proof of a causal relationship.
+    Distinguish asserted, opinion, speculative, and hypothetical source content
+    independently of extraction confidence. Explicit conditional scope takes
+    precedence over modal words, and applies to conditions as well as outcomes.
+    Secondary relations inherit the source factuality of their governing event
+    unless the source explicitly distinguishes them.
+    Preserve explicit negation independently of factuality. Its evidence must
+    include the source's negation, not an invented affirmative paraphrase.
+    Preserve subordinate, relative, coordinated, and embedded propositions.
+    Resolve semantic references without rewriting the literal source evidence;
+    an omitted subject or copula must not be reconstructed inside a source quote.
+    An intentional actor is an agent; a participant undergoing failure,
+    recovery, cessation, or another change is a patient. Grammatical subject
+    position alone does not determine the role. 'The door opened' describes
+    an affected door without an asserted agent; 'It rained' has no actor.
+    Resolve omitted subjects in coordinated clauses only where they are shared
+    unambiguously. 'Alice opened the door and entered' shares Alice; 'Alice met
+    Mary. She entered' does not identify one woman without further evidence.
+    Reported beliefs do not establish their content as fact. A stated belief
+    uses opinion; an uncertain possibility uses speculative; content inside an
+    explicit conditional uses hypothetical even if the sentence includes may.
+    Preserve the complete measurement, including its unit or counted object.
+    A duration is not a clock time, an event is not a date, and purpose is not
+    evidence that the intended action happened. Do not calculate conversions.
+    Distinguish location of an event from location of a persistent entity.
+    Preserve temporal argument order: earlier before later, later after earlier,
+    and the contained event before the containing interval for during.
   context: |
     You are a semantic parser that converts English sentences into
     structured semantic assertions.

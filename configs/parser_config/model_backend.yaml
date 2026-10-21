@@ -1,6 +1,6 @@
 # ── Active model ───────────────────────────────────────────────────────────────────────────────
 # Choose one model you want to use below. Credentials always stay in .env.
-active: ollama_qwen3_8b
+active: ollama_catalog
 
 # ── Provider profiles ───────────────────────────────────────────────────────────────────────────
 profiles:
@@ -35,6 +35,13 @@ profiles:
 
   # Local or self-hosted models ────────────────────────────────────────────────────────
 
+  ollama:
+    # Retained profile spelling; it uses the same document parser.
+    provider: ollama
+    model: qwen3:8b
+    host_env: OLLAMA_HOST
+    max_output_tokens: 512
+
   ollama_qwen05:
     provider: ollama
     model: qwen2.5:0.5b
@@ -65,9 +72,26 @@ profiles:
     host_env: OLLAMA_HOST
     max_output_tokens: 1024
 
+  ollama_catalog:
+    # Catalog-document extraction has its own output budget and settings.
+    provider: ollama
+    model: qwen3:8b
+    host_env: OLLAMA_HOST
+    max_output_tokens: 3072
+    think: false
+    temperature: 0.0
+
   transformers_local:
     # A locally downloaded Hugging Face model; no provider API key is required.
     provider: transformers-local
     model: Qwen/Qwen2.5-3B-Instruct
     hf_token_env: HF_TOKEN
     max_new_tokens: 512
+
+  semantic_document_student:
+    # Requires a checkpoint trained for the document target.
+    provider: transformers-local
+    model: models/semantic_document_parser
+    max_new_tokens: 3072
+    role: student
+    add_special_tokens: false

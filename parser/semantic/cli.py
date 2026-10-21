@@ -1,4 +1,4 @@
-"""Command-line interface for parsing, dataset generation, and student training."""
+"""One semantic-document CLI for teacher extraction, distillation and inference."""
 
 from __future__ import annotations
 
@@ -9,386 +9,134 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from parser.semantic.dataset import (
-    SemanticDatasetBuilder,
     split_pairs,
     structured_to_pairs,
     validate_student_pair,
     verify_split_overlap,
     write_pairs_jsonl,
 )
-from parser.semantic.metta_renderer import render_metta, validate_rendered_metta
 from parser.semantic.model_config import build_reference_semantic_parser
-from parser.semantic.normalization import normalize_semantic_result
-from parser.semantic.schema import SemanticParseResult
 from parser.semantic.semantic_parser import (
     DistilledSemanticParser,
     ModelGenerationError,
-    ReferenceSemanticParser,
     SemanticParseError,
 )
 
 
+def add_document_export_arguments(arguments: argparse.ArgumentParser) -> None:
+    """Register the same document export options for both entry points."""
+    arguments.add_argument("--input", required=True, type=Path)
+    arguments.add_argument("--output", required=True, type=Path)
+    arguments.add_argument("--rejected-output", required=True, type=Path)
+    arguments.add_argument("--student-pairs-output", type=Path)
+    arguments.add_argument(
+        "--corpus-id", help="namespace for sentence or manifest inputs"
+    )
+    add_document_target_arguments(arguments)
+
+
+def add_document_target_arguments(arguments: argparse.ArgumentParser) -> None:
+    """Share catalog and decoding configuration across dataset and export commands."""
+    arguments.add_argument(
+        "--bundle-output",
+        type=Path,
+        help="export the exact ontology bundle used for document validation",
+    )
+    arguments.add_argument("--model-revision")
+    arguments.add_argument(
+        "--require-structured-output",
+        action="store_true",
+        help="fail before generation if the backend cannot constrain JSON-schema decoding",
+    )
+    ontology = arguments.add_mutually_exclusive_group()
+    ontology.add_argument("--ontology-bundle", type=Path)
+    ontology.add_argument(
+        "--ontology-module", action="append", dest="ontology_modules", metavar="NAME"
+    )
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
-    """Create the semantic-parser command-line interface."""
-    parser = argparse.ArgumentParser(
-        prog="semantic-parser",
-        description="Convert natural-language text into validated semantics.",
-        epilog="Use 'semantic-parser <command> --help' for command options.",
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        help="model configuration YAML (default: project configuration)",
-    )
-    parser.add_argument(
-        "--profile",
-        help="named model profile (default: active profile from configuration)",
-    )
+    """All generation commands use the semantic-document-v1 target."""
+    parser = argparse.ArgumentParser(prog="semantic-parser")
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--profile")
     commands = parser.add_subparsers(dest="command", required=True)
-
-    # ── parse command (Reference/Teacher) ─────────────────────────────────────
-
-    parse_command = commands.add_parser(
-        "parse",
-        help="parse one sentence using reference parser (teacher)",
-        description="Parse one sentence into validated MeTTa expressions.",
+    for name in ("build-dataset", "export-documents"):
+        command = commands.add_parser(
+            name, help="generate validated documents and optional student pairs"
+        )
+        add_document_export_arguments(command)
+        command.add_argument(
+            "--target",
+            choices=("semantic-document-v1",),
+            default="semantic-document-v1",
+        )
+    parse = commands.add_parser(
+        "parse", help="parse exact source text to a semantic document"
     )
-    parse_command.add_argument("sentence", help="natural-language sentence to parse")
-    parse_command.add_argument(
-        "--context",
-        default="",
-        help="optional context used for reference resolution",
+    parse.add_argument("sentence")
+    parse.add_argument("--context", default="")
+    parse.add_argument("--format", choices=("json", "metta"), default="json")
+    convert = commands.add_parser(
+        "convert-to-pairs", help="recover document-target student pairs"
     )
-
-    # ── build-dataset command ─────────────────────────────────────────────────
-
-    dataset_command = commands.add_parser(
-        "build-dataset",
-        help="build a text-to-JSON dataset from sentences",
+    convert.add_argument("--input", required=True, type=Path)
+    convert.add_argument("--output", required=True, type=Path)
+    split = commands.add_parser("split-pairs")
+    split.add_argument("--input", required=True, type=Path)
+    split.add_argument("--output-dir", required=True, type=Path)
+    split.add_argument("--train-ratio", type=float, default=0.8)
+    split.add_argument("--val-ratio", type=float, default=0.1)
+    split.add_argument("--test-ratio", type=float, default=0.1)
+    split.add_argument("--seed", type=int, default=42)
+    training = commands.add_parser("train-student")
+    training.add_argument("--train-file", required=True, type=Path)
+    training.add_argument("--val-file", type=Path)
+    training.add_argument("--training-config", type=Path)
+    training.add_argument("--output-dir", type=Path)
+    training.add_argument("--method", choices=("lora", "full"), default="full")
+    student = commands.add_parser(
+        "distill", help="infer the same target with a document-trained student"
     )
-    dataset_command.add_argument(
-        "--input",
-        type=Path,
-        required=True,
-        help=(
-            "UTF-8 text file containing one sentence per line, or a JSONL "
-            "manifest containing text/source_dataset/source_domain"
-        ),
+    student.add_argument("sentence")
+    student.add_argument(
+        "--model-dir", type=Path, default=Path("models/semantic_document_parser")
     )
-    dataset_command.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="JSONL path for accepted structured records",
+    student.add_argument("--format", choices=("json", "metta"), default="json")
+    e2e = commands.add_parser(
+        "e2e", help="extract, split, train and evaluate one document target"
     )
-    dataset_command.add_argument(
-        "--rejected-output",
-        type=Path,
-        help="JSONL path for rejected records (default: derived from --output)",
-    )
-    dataset_command.add_argument(
-        "--include-metta",
-        action="store_true",
-        help="include derived MeTTa expressions for auditing",
-    )
-    dataset_command.add_argument(
-        "--asserted-only",
-        action="store_true",
-        help=(
-            "keep only assertions whose factuality is 'asserted'; "
-            "reject sentences with no asserted assertions"
-        ),
-    )
-
-    # ── convert-to-pairs command ──────────────────────────────────────────────
-
-    convert_command = commands.add_parser(
-        "convert-to-pairs",
-        help="convert structured JSON to training pairs for student",
-    )
-    convert_command.add_argument(
-        "--input",
-        type=Path,
-        required=True,
-        help="Input structured JSONL file",
-    )
-    convert_command.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Output JSONL file with (input, label) pairs",
-    )
-    convert_command.add_argument(
-        "--max-per-text",
-        type=int,
-        default=1,
-        help="Deprecated compatibility option; full structured labels are always kept",
-    )
-    convert_command.add_argument(
-        "--include-confidence",
-        action="store_true",
-        help="Include confidence scores in output",
-    )
-    # ── split-pairs command ───────────────────────────────────────────────────────
-    split_command = commands.add_parser(
-        "split-pairs",
-        help="split student pairs into train, validation, and test sets",
-    )
-    split_command.add_argument(
-        "--input",
-        type=Path,
-        required=True,
-        help="Input JSONL file containing student (input, label) pairs",
-    )
-    split_command.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="Directory for train.jsonl, validation.jsonl, and test.jsonl",
-    )
-    split_command.add_argument("--train-ratio", type=float, default=0.8)
-    split_command.add_argument("--val-ratio", type=float, default=0.1)
-    split_command.add_argument("--test-ratio", type=float, default=0.1)
-    split_command.add_argument("--seed", type=int, default=42)
-
-    # ── train-student command ─────────────────────────────────────────────────
-
-    train_command = commands.add_parser(
-        "train-student",
-        help="train student model on teacher-generated pairs",
-    )
-    train_command.add_argument(
-        "--train-file",
-        type=Path,
-        required=True,
-        help="Training pairs JSONL file",
-    )
-    train_command.add_argument(
-        "--val-file", type=Path, help="Optional separate validation pairs JSONL file"
-    )
-    train_command.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("models/distil_parser"),
-        help="Output directory for trained model",
-    )
-    train_command.add_argument(
-        "--method",
-        choices=["lora", "full"],
-        default="full",
-        help="Training method: lora or full (default: full)",
-    )
-
-    # ── distill command (Student/Distilled) ──────────────────────────────────
-
-    distill_command = commands.add_parser(
-        "distill",
-        help="parse using distilled (student) model",
-        description="Parse a sentence using the fine-tuned student model.",
-    )
-    distill_command.add_argument(
-        "--model-dir",
-        type=Path,
-        default=Path("models/distil_parser"),
-        help="Model directory (default: models/distil_parser)",
-    )
-    distill_command.add_argument(
-        "sentence",
-        help="natural-language sentence to parse",
-    )
-
-    # ── end-to-end command ────────────────────────────────────────────────────
-
-    e2e_command = commands.add_parser(
-        "e2e",
-        help="end-to-end pipeline: teacher → dataset → student → inference",
-        description="Run the complete pipeline from teacher to distilled parser.",
-    )
-    e2e_command.add_argument(
-        "--input",
-        type=Path,
-        help="UTF-8 text file containing one sentence per line (optional)",
-    )
-    e2e_command.add_argument(
-        "--sentences",
-        nargs="+",
-        help="Sentences to parse directly from command line",
-    )
-    e2e_command.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("models/distil_parser"),
-        help="Output directory for trained model",
-    )
-    e2e_command.add_argument(
-        "--method",
-        choices=["lora", "full"],
-        default="full",
-        help="Training method: lora or full (default: full)",
-    )
-    e2e_command.add_argument(
-        "--test-sentence",
-        help="Optional test sentence to parse after training",
-    )
-    e2e_command.add_argument(
-        "--skip-training",
-        action="store_true",
-        help="Skip training, use existing model",
-    )
-    e2e_command.add_argument(
-        "--force",
-        action="store_true",
-        help="Force re-generation of data",
-    )
-
+    e2e.add_argument("--input", required=True, type=Path)
+    e2e.add_argument("--output-dir", required=True, type=Path)
+    e2e.add_argument("--training-config", type=Path)
+    e2e.add_argument("--method", choices=("lora", "full"), default="lora")
     return parser
 
 
-# ── Command implementations ──────────────────────────────────────────────────
+def _print_document(document, output_format: str) -> None:
+    if output_format == "json":
+        print(document.canonical_json())
+    elif document.assertions or document.rules:
+        from parser.semantic.compatibility import document_to_legacy_result
+        from parser.semantic.semantic_parser import ReferenceSemanticParser
 
-
-def _build_semantic_parser(arguments: argparse.Namespace) -> ReferenceSemanticParser:
-    """Build a reference parser (teacher) from config."""
-    return build_reference_semantic_parser(
-        arguments.config, profile_name=arguments.profile
-    )
+        view = document_to_legacy_result(document)
+        for atom in ReferenceSemanticParser.render_metta(view):
+            print(atom)
 
 
 def _run_parse(arguments: argparse.Namespace) -> None:
-    """Run the reference parser (teacher)."""
-    parser = _build_semantic_parser(arguments)
-    for atom in parser.parse(arguments.sentence, context=arguments.context):
-        print(atom)
-
-
-def _run_dataset(arguments: argparse.Namespace) -> None:
-    """Build dataset using teacher."""
-    input_path: Path = arguments.input
-    output_path: Path = arguments.output
-
-    rejected_path: Path = arguments.rejected_output or output_path.with_name(
-        f"{output_path.stem}.rejected{output_path.suffix}"
+    parser = build_reference_semantic_parser(
+        arguments.config, profile_name=arguments.profile
     )
-
-    resolved_paths = {
-        input_path.resolve(),
-        output_path.resolve(),
-        rejected_path.resolve(),
-    }
-
-    if len(resolved_paths) != 3:
-        raise ValueError(
-            "Input, accepted-output, and rejected-output paths must differ"
-        )
-
-    builder = SemanticDatasetBuilder(
-        _build_semantic_parser(arguments),
-        include_metta=arguments.include_metta,
-        asserted_only=arguments.asserted_only,
+    _print_document(
+        parser.parse(arguments.sentence, context=arguments.context), arguments.format
     )
-
-    accepted = []
-    rejected = []
-
-    if input_path.suffix.lower() == ".jsonl":
-        with input_path.open("r", encoding="utf-8") as file:
-            for line_number, line in enumerate(file, start=1):
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise ValueError(
-                        f"Invalid JSON at {input_path}:{line_number}: {error.msg}"
-                    ) from error
-
-                if not isinstance(record, dict):
-                    raise ValueError(
-                        f"Invalid record at {input_path}:{line_number}: "
-                        "expected a JSON object"
-                    )
-
-                text = record.get("text")
-                if not isinstance(text, str):
-                    raise ValueError(
-                        f"Invalid record at {input_path}:{line_number}: "
-                        "'text' must be a string"
-                    )
-
-                source_dataset = record.get("source_dataset")
-                source_domain = record.get("source_domain")
-
-                if source_dataset is not None and not isinstance(source_dataset, str):
-                    raise ValueError(
-                        f"Invalid record at {input_path}:{line_number}: "
-                        "'source_dataset' must be a string or null"
-                    )
-
-                if source_domain is not None and not isinstance(source_domain, str):
-                    raise ValueError(
-                        f"Invalid record at {input_path}:{line_number}: "
-                        "'source_domain' must be a string or null"
-                    )
-
-                batch_accepted, batch_rejected = builder.generate(
-                    [text],
-                    source_dataset=source_dataset,
-                    source_domain=source_domain,
-                )
-
-                accepted.extend(batch_accepted)
-                rejected.extend(batch_rejected)
-
-                # Progress + checkpoint every 100 processed input records
-                if line_number % 100 == 0:
-                    builder.write_jsonl(accepted, output_path)
-                    builder.write_rejected_jsonl(rejected, rejected_path)
-
-                    print(
-                        f"Processed {line_number} records | "
-                        f"accepted={len(accepted)} "
-                        f"rejected={len(rejected)}"
-                    )
-
-    else:
-        sentences = input_path.read_text(encoding="utf-8").splitlines()
-        accepted, rejected = builder.generate(sentences)
-
-    builder.write_jsonl(accepted, output_path)
-    builder.write_rejected_jsonl(rejected, rejected_path)
-
-    print(f"Accepted: {len(accepted)} -> {output_path}")
-    print(f"Rejected: {len(rejected)} -> {rejected_path}")
 
 
 def _run_convert_to_pairs(arguments: argparse.Namespace) -> None:
-    """Convert structured JSON to (input, label) pairs."""
-    input_path: Path = arguments.input
-    output_path: Path = arguments.output
-
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-
-    if input_path.resolve() == output_path.resolve() or (
-        output_path.exists() and input_path.samefile(output_path)
-    ):
-        raise ValueError("Input and output paths must differ")
-
-    print("Converting structured JSON to training pairs...")
-    print(f"  Input:  {input_path}")
-    print(f"  Output: {output_path}")
-
-    pairs = structured_to_pairs(
-        str(input_path),
-        str(output_path),
-        max_per_text=arguments.max_per_text,
-        include_confidence=arguments.include_confidence,
-    )
-
-    print(f"Generated {len(pairs)} pairs -> {output_path}")
+    pairs = structured_to_pairs(str(arguments.input), str(arguments.output))
+    print(f"Student pairs: {len(pairs)} -> {arguments.output}")
 
 
 def _run_split_pairs(arguments: argparse.Namespace) -> None:
@@ -409,6 +157,9 @@ def _run_split_pairs(arguments: argparse.Namespace) -> None:
         != 4
     ):
         raise ValueError("Input and split-output paths must differ")
+    for path in (train_path, val_path, test_path):
+        if path.exists():
+            raise ValueError(f"Refusing to overwrite existing split: {path}")
 
     pairs = []
     with input_path.open("r", encoding="utf-8") as file:
@@ -431,6 +182,12 @@ def _run_split_pairs(arguments: argparse.Namespace) -> None:
                     "expected an object with a string input"
                 )
 
+            try:
+                validate_student_pair(pair)
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid pair at {input_path}:{line_number}: {error}"
+                ) from error
             pairs.append(pair)
 
     train_pairs, val_pairs, test_pairs = split_pairs(
@@ -461,11 +218,15 @@ def _run_train_student(arguments: argparse.Namespace) -> None:
     print(f"  Method: {arguments.method}")
     print(f"  Output: {arguments.output_dir}")
 
+    training_options = {}
+    if arguments.training_config is not None:
+        training_options["config_path"] = str(arguments.training_config)
     train(
         train_file=str(arguments.train_file),
         val_file=str(arguments.val_file) if arguments.val_file else None,
-        output_dir=str(arguments.output_dir),
+        output_dir=str(arguments.output_dir) if arguments.output_dir else None,
         method=arguments.method,
+        **training_options,
     )
 
 
@@ -546,413 +307,114 @@ def _require_checkpoint(model_dir: Path) -> None:
 
 
 def _run_distill(arguments: argparse.Namespace) -> None:
-    """Parse using the distilled (student) model."""
-    model_dir: Path = arguments.model_dir
-    sentence: str = arguments.sentence
-
-    _require_checkpoint(model_dir)
-
-    distilled_parser = DistilledSemanticParser.from_pretrained(str(model_dir))
-
-    try:
-        atoms = distilled_parser.parse(sentence)
-
-        for atom in atoms:
-            print(atom)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    _require_checkpoint(arguments.model_dir)
+    parser = DistilledSemanticParser.from_pretrained(str(arguments.model_dir))
+    _print_document(parser.parse(arguments.sentence), arguments.format)
 
 
-def _get_sentences(arguments: argparse.Namespace) -> list[str]:
-    """Get sentences from input file, command line, or defaults."""
-    if arguments.input:
-        print(f"  Reading sentences from: " f"{arguments.input}")
+def _run_e2e(arguments: argparse.Namespace) -> int:
+    """Use an explicit fresh run directory, never reuse stale labels/checkpoints."""
+    from parser.semantic.catalog_document_cli import run_export
+    from parser.semantic.catalog_student import document_target
+    from parser.student.train import train
 
-        sentences = Path(arguments.input).read_text(encoding="utf-8").splitlines()
-
-        return [sentence.strip() for sentence in sentences if sentence.strip()]
-
-    if arguments.sentences:
-        print(f"  Using " f"{len(arguments.sentences)} " "sentences from command line")
-
-        return [
-            sentence.strip() for sentence in arguments.sentences if sentence.strip()
-        ]
-
-    print("  No input provided. Using default sentences.")
-
-    return [
-        "Dogs are animals.",
-        "Birds can fly.",
-        "The dog has fur.",
-        "Rain causes flooding.",
-        "Cats are mammals.",
-        "The wheel is part of the car.",
-        "Mary is happy.",
-        "The cup is on the table.",
-        "Smoking causes lung cancer.",
-        "Children need education.",
-        "The heart is part of the body.",
-        "Fear causes stress.",
-        "Fish can swim.",
-        "The tree has leaves.",
-        "Peter is sad.",
-        "The book is on the shelf.",
-        "Exercise improves health.",
-        "Wolves are predators.",
-        "The engine is part of the car.",
-        "Ben loves animals.",
-    ]
-
-
-def _run_e2e(arguments: argparse.Namespace) -> None:
-    """End-to-end pipeline: teacher → dataset → student → inference."""
-    print("\n" + "=" * 70)
-    print("END-TO-END PIPELINE")
-    print("=" * 70)
-
-    output_dir: Path = arguments.output_dir
-    method: str = arguments.method
-    force: bool = arguments.force
-    skip_training: bool = arguments.skip_training
-
-    if skip_training:
-        _require_checkpoint(output_dir)
-
-    # ── Get sentences ─────────────────────────────────────────────────────────
-
-    sentences = _get_sentences(arguments)
-
-    print(f"  Sentences: {len(sentences)}")
-
-    # ── Step 1: Generate structured JSON from teacher ─────────────────────────
-
-    print("\nStep 1: Teacher generates structured JSON")
-
-    structured_file = Path("data/teacher_structured.jsonl")
-    structured_file.parent.mkdir(parents=True, exist_ok=True)
-
-    structured_regenerated = not structured_file.exists() or force
-
-    if not structured_regenerated:
-        print(f"  Using existing structured data: " f"{structured_file}")
-
-    else:
-        print(f"  Generating structured data for " f"{len(sentences)} sentences...")
-
-        parser = _build_semantic_parser(arguments)
-        builder = SemanticDatasetBuilder(parser, include_metta=True)
-        accepted, rejected = builder.generate(sentences)
-        builder.write_jsonl(accepted, structured_file)
-        rejected_path = structured_file.with_name(
-            f"{structured_file.stem}" f".rejected" f"{structured_file.suffix}"
+    root = arguments.output_dir
+    if root.exists():
+        raise ValueError(
+            "e2e requires a new run directory; existing artifacts are never overwritten"
         )
-        builder.write_rejected_jsonl(rejected, rejected_path)
-        print(f"  Accepted: {len(accepted)} -> {structured_file}")
-        print(f"  Rejected: {len(rejected)} -> {rejected_path}")
-
-    # ── Step 2: Convert to training pairs ─────────────────────────────────────
-
-    print("\nStep 2: Convert to training pairs")
-
-    pairs_file = Path("data/train_pairs.jsonl")
-
-    pairs_regenerated = structured_regenerated or not pairs_file.exists() or force
-
-    if not pairs_regenerated:
-        print(f"  Using existing pairs: " f"{pairs_file}")
-
-    else:
-        if not structured_file.exists():
-            raise FileNotFoundError(f"Structured file not found: " f"{structured_file}")
-
-        pairs = structured_to_pairs(
-            str(structured_file),
-            str(pairs_file),
-            include_confidence=True,
-        )
-
-        print(f"  Generated {len(pairs)} pairs " f"-> {pairs_file}")
-
-    # ── Step 3: Split train / validation / test ───────────────────────────────
-
-    print("\nStep 3: Split train / validation / test")
-
-    split_dir = Path("data/splits")
-
-    train_file = split_dir / "train.jsonl"
-    val_file = split_dir / "validation.jsonl"
-    test_file = split_dir / "test.jsonl"
-
-    if (
-        train_file.exists()
-        and val_file.exists()
-        and test_file.exists()
-        and not pairs_regenerated
-    ):
-        cached_splits = []
-
-        for path in (
-            train_file,
-            val_file,
-            test_file,
-        ):
-            records = []
-
-            with path.open(encoding="utf-8") as file:
-                for line_number, line in enumerate(
-                    file,
-                    start=1,
-                ):
-                    if not line.strip():
-                        continue
-
-                    try:
-                        pair = json.loads(line)
-                    except json.JSONDecodeError as error:
-                        raise ValueError(
-                            f"Invalid JSON at " f"{path}:{line_number}"
-                        ) from error
-
-                    try:
-                        validate_student_pair(pair)
-                    except ValueError as error:
-                        raise ValueError(
-                            f"Invalid pair at " f"{path}:{line_number}: " f"{error}"
-                        ) from error
-
-                    records.append(pair)
-
-            cached_splits.append(records)
-
-        verify_split_overlap(*cached_splits)
-
-        print("  Using existing dataset splits")
-        print(f"  Train:      {train_file}")
-        print(f"  Validation: {val_file}")
-        print(f"  Test:       {test_file}")
-
-    else:
-        pairs = []
-
-        with pairs_file.open("r", encoding="utf-8") as file:
-            for line_number, line in enumerate(file, start=1):
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                try:
-                    pair = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise ValueError(
-                        f"Invalid JSON at "
-                        f"{pairs_file}:{line_number}: "
-                        f"{error.msg}"
-                    ) from error
-
-                pairs.append(pair)
-
-        train_pairs, val_pairs, test_pairs = split_pairs(
-            pairs,
+    documents, pairs = root / "documents.jsonl", root / "pairs.jsonl"
+    export_args = argparse.Namespace(
+        config=arguments.config,
+        profile=arguments.profile,
+        input=arguments.input,
+        output=documents,
+        rejected_output=root / "rejected.jsonl",
+        student_pairs_output=pairs,
+        bundle_output=root / "ontology.bundle.json",
+        ontology_bundle=None,
+        ontology_modules=None,
+        model_revision=None,
+        require_structured_output=False,
+        corpus_id=None,
+    )
+    if run_export(export_args):
+        raise ValueError("Extraction rejected sources; audit the run before training")
+    _run_split_pairs(
+        argparse.Namespace(
+            input=pairs,
+            output_dir=root / "splits",
             train_ratio=0.8,
             val_ratio=0.1,
             test_ratio=0.1,
             seed=42,
         )
-
-        verify_split_overlap(
-            train_pairs,
-            val_pairs,
-            test_pairs,
-        )
-
-        write_pairs_jsonl(train_pairs, train_file)
-        write_pairs_jsonl(val_pairs, val_file)
-        write_pairs_jsonl(test_pairs, test_file)
-
-        print(f"  Train:      " f"{len(train_pairs)} " f"-> {train_file}")
-        print(f"  Validation: " f"{len(val_pairs)} " f"-> {val_file}")
-        print(f"  Test:       " f"{len(test_pairs)} " f"-> {test_file}")
-
-    # ── Step 4: Train student model ───────────────────────────────────────────
-
-    print("\nStep 4: Train student model")
-
-    model_dir = output_dir
-
-    checkpoint_error = _checkpoint_error(model_dir)
-
-    if skip_training:
-        print("  Skipping training (--skip-training)")
-
-    elif checkpoint_error is None and not force:
-        print(f"  Using existing model: " f"{model_dir}")
-
-    else:
-        if checkpoint_error is not None:
-            print(f"  Training required: " f"{checkpoint_error}")
-
-        from parser.student.train import train
-
-        train(
-            train_file=str(train_file),
-            val_file=str(val_file),
-            output_dir=str(model_dir),
-            method=method,
-        )
-
-    # ── Step 5: Run inference ─────────────────────────────────────────────────
-
-    print("\nStep 5: Inference with distilled parser")
-
-    expected = None
-
-    if arguments.test_sentence:
-        test_sentences = [arguments.test_sentence]
-
-        print("  Syntax check only: " "no expected label supplied")
-
-    else:
-        test_sentences = []
-        expected = []
-
-        with test_file.open(encoding="utf-8") as file:
-            for line_number, line in enumerate(file, start=1):
-                if not line.strip():
-                    continue
-
-                try:
-                    pair = json.loads(line)
-
-                    validate_student_pair(pair)
-
-                    target = normalize_semantic_result(
-                        SemanticParseResult.model_validate_json(pair["label"])
-                    )
-
-                    target = ReferenceSemanticParser.validate_predicates(target)
-
-                    target = ReferenceSemanticParser.validate_arguments(target)
-
-                    atoms = validate_rendered_metta(render_metta(target))
-
-                except ValueError as error:
-                    raise ValueError(
-                        f"Invalid test label at "
-                        f"{test_file}:{line_number}: "
-                        f"{error}"
-                    ) from error
-
-                test_sentences.append(pair["input"])
-
-                expected.append(sorted(str(atom) for atom in atoms))
-
-    if not test_sentences:
-        raise ValueError("No test examples available for evaluation")
-
-    _require_checkpoint(model_dir)
-
-    # Use the new DistilledSemanticParser
-    distilled_parser = DistilledSemanticParser.from_pretrained(str(model_dir))
-
-    print(f"\n  Model: {model_dir}")
-    print(f"  Test sentences: " f"{len(test_sentences)}")
-    print()
-
-    valid_count = 0
-    correct_count = 0
-
-    for index, sentence in enumerate(test_sentences):
-        try:
-            atoms = distilled_parser.parse(sentence)
-
-            metta = " ".join(str(atom) for atom in atoms)
-
-            status = "OK"
-            valid_count += 1
-
-            if expected is not None:
-                matches = sorted(str(atom) for atom in atoms) == expected[index]
-
-                correct_count += int(matches)
-
-                status = "MATCH" if matches else "MISMATCH"
-
-        except Exception as error:
-            metta = f"Error: {error}"
-            status = "FAIL"
-
-        print(f"  [{status}] " f"'{sentence[:40]:40s}' " f"-> {metta}")
-
-    print(f"\nResults: " f"{valid_count}/" f"{len(test_sentences)} valid")
-
-    if expected is not None:
-        print(
-            f"Exact relation match: "
-            f"{correct_count}/"
-            f"{len(test_sentences)} "
-            f"("
-            f"{correct_count / len(test_sentences):.1%}"
-            f")"
-        )
-
-    if valid_count < len(test_sentences):
-        raise ValueError("Evaluation had prediction failures; " "see results above")
-
-    print("\n" + "=" * 70)
-    print("PIPELINE COMPLETE!")
-    print("=" * 70)
-    print(f"  Model saved to: " f"{model_dir}")
-    print(
-        "    distilled_parser = "
-        "DistilledSemanticParser"
-        f".from_pretrained('{model_dir}')"
     )
-    print("    result = distilled_parser.parse" "('Dogs are animals.')")
+    train_file, val_file, test_file = (
+        root / "splits" / name
+        for name in ("train.jsonl", "validation.jsonl", "test.jsonl")
+    )
+    if not train_file.stat().st_size or not test_file.stat().st_size:
+        raise ValueError("Need nonempty source-disjoint training and test sets")
+    options = (
+        {"config_path": str(arguments.training_config)}
+        if arguments.training_config
+        else {}
+    )
+    model_dir = train(
+        train_file=str(train_file),
+        val_file=str(val_file),
+        method=arguments.method,
+        output_dir=str(root / "student"),
+        **options,
+    )
+    student = DistilledSemanticParser.from_pretrained(model_dir)
+    valid = exact = total = 0
+    with test_file.open(encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            pair = json.loads(line)
+            validate_student_pair(pair)
+            total += 1
+            try:
+                document = student.parse(pair["input"])
+                valid += 1
+                exact += int(document_target(document) == json.loads(pair["label"]))
+                print(document.canonical_json())
+            except (ValueError, RuntimeError) as error:
+                print(f"Prediction rejected: {error}", file=sys.stderr)
+    print(
+        f"Validated documents: {valid}/{total}; exact target matches: {exact}/{total}"
+    )
+    print(
+        "Exact target matching is ID-sensitive; this is not a semantic equivalence metric."
+    )
+    return 0 if valid == total else 2
 
 
-def main(
-    argv: Sequence[str] | None = None,
-) -> int:
-    """Run the selected command and return its process exit status."""
+def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_argument_parser().parse_args(argv)
-
     try:
-        if arguments.command == "parse":
-            _run_parse(arguments)
+        if arguments.command in ("build-dataset", "export-documents"):
+            from parser.semantic.catalog_document_cli import run_export
 
-        elif arguments.command == "build-dataset":
-            _run_dataset(arguments)
-
-        elif arguments.command == "convert-to-pairs":
-            _run_convert_to_pairs(arguments)
-
-        elif arguments.command == "split-pairs":
-            _run_split_pairs(arguments)
-
-        elif arguments.command == "train-student":
-            _run_train_student(arguments)
-
-        elif arguments.command == "distill":
-            _run_distill(arguments)
-
-        elif arguments.command == "e2e":
-            _run_e2e(arguments)
-
-        else:
-            print(
-                f"Unknown command: " f"{arguments.command}",
-                file=sys.stderr,
-            )
-            return 1
+            return run_export(arguments)
+        handlers = {
+            "parse": _run_parse,
+            "distill": _run_distill,
+            "convert-to-pairs": _run_convert_to_pairs,
+            "split-pairs": _run_split_pairs,
+            "train-student": _run_train_student,
+        }
+        if arguments.command == "e2e":
+            return _run_e2e(arguments)
+        handlers[arguments.command](arguments)
     except (ModelGenerationError, OSError, SemanticParseError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

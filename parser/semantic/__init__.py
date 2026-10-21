@@ -1,5 +1,7 @@
 """Public API for reference and distilled semantic parsing."""
 
+from hybrid_miner.contracts import SemanticDocument
+
 from parser.semantic.backends import (
     AnthropicBackend,
     CallableBackend,
@@ -10,11 +12,7 @@ from parser.semantic.backends import (
     OpenAICompatibleBackend,
     TransformersBackend,
 )
-from parser.semantic.dataset import (
-    DistillationRecord,
-    RejectedRecord,
-    SemanticDatasetBuilder,
-)
+from parser.semantic.dataset import RejectedRecord, SemanticDatasetBuilder
 from parser.semantic.model_config import (
     ModelProfile,
     build_distilled_semantic_parser,
@@ -46,7 +44,7 @@ __all__ = [
     "ALLOWED_PREDICATES",
     "AnthropicBackend",
     "CallableBackend",
-    "DistillationRecord",
+    "SemanticDocument",
     "DistilledSemanticParser",
     "GeminiBackend",
     "ModelBackend",

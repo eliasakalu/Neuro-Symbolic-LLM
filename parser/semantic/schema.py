@@ -1,4 +1,8 @@
-"""Validated data contract for structured semantic-parser output."""
+"""Historical assertion/rule records and derived renderer views.
+
+Active extraction and distillation use the shared SemanticDocument contract.
+These types do not define an independent model-generation target.
+"""
 
 from __future__ import annotations
 

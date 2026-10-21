@@ -21,6 +21,7 @@ from typing import Any
 
 import yaml
 
+from parser.ontology.catalog import OntologyCatalog, load_ontology_catalog
 from parser.semantic.backends import (
     AnthropicBackend,
     GeminiBackend,
@@ -153,8 +154,15 @@ def create_backend(profile: ModelProfile) -> ModelBackend:
             max_output_tokens=int(profile.settings.get("max_output_tokens", 256))
         )
     if profile.provider == "ollama":
+        think = profile.settings.get("think")
+        if think is not None and not isinstance(think, bool):
+            raise ValueError("Ollama profile 'think' must be a boolean")
+        temperature = profile.settings.get("temperature")
         return OllamaBackend(
-            max_output_tokens=int(profile.settings.get("max_output_tokens", 256))
+            max_output_tokens=int(profile.settings.get("max_output_tokens", 256)),
+            think=think,
+            temperature=float(temperature) if temperature is not None else None,
+            seed=profile.settings.get("seed"),
         )
     if profile.provider == "openai-compatible":
         api_key_env = profile.settings.get("api_key_env")
@@ -170,6 +178,9 @@ def create_backend(profile: ModelProfile) -> ModelBackend:
             max_output_tokens=int(profile.settings.get("max_output_tokens", 256)),
         )
     if profile.provider == "transformers-local":
+        add_special_tokens = profile.settings.get("add_special_tokens", True)
+        if not isinstance(add_special_tokens, bool):
+            raise ValueError("Local profile 'add_special_tokens' must be a boolean")
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as error:
@@ -182,6 +193,7 @@ def create_backend(profile: ModelProfile) -> ModelBackend:
             tokenizer=tokenizer,
             model=model,
             max_new_tokens=int(profile.settings.get("max_new_tokens", 256)),
+            add_special_tokens=add_special_tokens,
         )
     raise ValueError(
         f"Unsupported provider {profile.provider!r} in profile {profile.name!r}"
@@ -195,13 +207,29 @@ def build_reference_semantic_parser(
     config_path: str | Path | None = None,
     *,
     profile_name: str | None = None,
+    catalog: OntologyCatalog | None = None,
+    model_revision: str | None = None,
+    require_structured_output: bool = False,
 ) -> ReferenceSemanticParser:
     """Build a reference parser using the active YAML model profile."""
 
     profile = load_model_profile(config_path, profile_name=profile_name)
+    if (
+        profile.settings.get("role") == "student"
+        or (Path(profile.model) / "training_metadata.json").is_file()
+    ):
+        from parser.semantic.catalog_student import validate_catalog_student_checkpoint
+
+        validate_catalog_student_checkpoint(
+            profile.model,
+            catalog=catalog if catalog is not None else load_ontology_catalog(),
+        )
     return ReferenceSemanticParser(
         backend=create_backend(profile),
         config=SemanticParserConfig(model_name=profile.model),
+        catalog=catalog,
+        model_revision=model_revision,
+        require_structured_output=require_structured_output,
     )
 
 
@@ -210,8 +238,14 @@ def build_distilled_semantic_parser(
     *,
     profile_name: str | None = None,
 ) -> DistilledSemanticParser:
-    """Build a distilled parser using the active YAML model profile."""
+    """Build the configured local document-target student."""
+    profile = load_model_profile(
+        config_path, profile_name=profile_name or "semantic_document_student"
+    )
+    if profile.provider != "transformers" or profile.settings.get("role") != "student":
+        raise ValueError("Distilled parser requires a local student model profile")
     return DistilledSemanticParser.from_pretrained(
-        model_dir="models/distil_parser",
-        device="auto",
+        model_dir=profile.model,
+        device=str(profile.settings.get("device", "auto")),
+        max_new_tokens=int(profile.settings.get("max_output_tokens", 3072)),
     )
