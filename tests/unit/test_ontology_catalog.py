@@ -71,6 +71,7 @@ def test_exports_ordered_immutable_type_signatures() -> None:
         frozenset({"Event"}),
         frozenset({"Entity"}),
     )
+    assert signatures["Event"] == (frozenset({"Event"}),)
     assert "AliasOf" not in signatures
     assert "ProvisionalRelation" not in signatures
     with pytest.raises(TypeError):
@@ -96,7 +97,7 @@ types: [Entity]
 relations:
   Entity:
     arity: 1
-    arguments: [{name: id, type: String}]
+    arguments: [{name: id, type: Entity}]
     confidence_range: [0.8, 1.0]
     extraction_instruction: Extract an entity.
   OpenObligation:
@@ -137,6 +138,25 @@ relations:
         load_ontology_catalog(tmp_path)
 
 
+def test_declared_type_relation_must_accept_its_own_type(tmp_path: Path) -> None:
+    _write_module(
+        tmp_path / "upper.yaml",
+        """
+version: upper-v1
+types: [Entity]
+relations:
+  Entity:
+    arity: 1
+    arguments: [{name: id, type: String}]
+    confidence_range: [0.8, 1.0]
+    extraction_instruction: Extract an entity.
+""",
+    )
+
+    with pytest.raises(OntologyCatalogError, match="must accept its own type"):
+        load_ontology_catalog(tmp_path)
+
+
 def test_rejects_duplicate_relation_across_modules(tmp_path: Path) -> None:
     definition = """
 version: {version}
@@ -144,7 +164,7 @@ version: {version}
 relations:
   Entity:
     arity: 1
-    arguments: [{{name: id, type: String}}]
+    arguments: [{{name: id, type: Entity}}]
     confidence_range: [0.8, 1.0]
     extraction_instruction: Extract an entity.
 """
@@ -176,7 +196,7 @@ types: [Entity]
 relations:
   Entity:
     arity: 1
-    arguments: [{{name: id, type: String}}]
+    arguments: [{{name: id, type: Entity}}]
     confidence_range: {confidence_range}
     extraction_instruction: Extract an entity.
 """,

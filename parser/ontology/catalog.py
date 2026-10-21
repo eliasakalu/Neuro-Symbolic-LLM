@@ -233,12 +233,12 @@ def load_ontology_catalog(
             ) from error
         raw = _require_mapping(document, path.name)
         required = _DOCUMENT_FIELDS
-        unknown = frozenset(raw) - required - _OPTIONAL_DOCUMENT_FIELDS
+        unknown_fields = frozenset(raw) - required - _OPTIONAL_DOCUMENT_FIELDS
         missing = required - frozenset(raw)
-        if missing or unknown:
+        if missing or unknown_fields:
             raise OntologyCatalogError(
                 f"{path.name} fields mismatch: missing={sorted(missing)}, "
-                f"unknown={sorted(unknown)}"
+                f"unknown={sorted(unknown_fields)}"
             )
 
         version = raw["version"]
@@ -279,6 +279,10 @@ def load_ontology_catalog(
         if relation is None or relation.arity != 1:
             raise OntologyCatalogError(
                 f"Declared type {type_name!r} must have a unary relation"
+            )
+        if relation.arguments[0].allowed_types != (type_name,):
+            raise OntologyCatalogError(
+                f"Declared type {type_name!r} must accept its own type"
             )
     allowed_types = declared_types | _PRIMITIVE_TYPES
     for relation in relations.values():

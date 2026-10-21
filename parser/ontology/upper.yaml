@@ -5,28 +5,28 @@ relations:
     arity: 1
     arguments:
       - name: object_id
-        type: String
+        type: Entity
     confidence_range: [0.8, 1.0]
     extraction_instruction: "Extract explicit physical objects, named entities, or abstract artifacts mentioned in the text."
   Event:
     arity: 1
     arguments:
       - name: event_id
-        type: String
+        type: Event
     confidence_range: [0.8, 1.0]
     extraction_instruction: "Extract discrete actions, occurrences, or state changes. Assign a unique identifier."
   Proposition:
     arity: 1
     arguments:
       - name: stmt_id
-        type: String
+        type: Proposition
     confidence_range: [0.7, 1.0]
     extraction_instruction: "Extract abstract claims or statements that carry a truth value (true or false)."
   Clause:
     arity: 1
     arguments:
       - name: clause_id
-        type: String
+        type: Clause
     confidence_range: [0.9, 1.0]
     extraction_instruction: "Identify distinct grammatical clauses (subject + predicate) directly from the text syntax."
   Agent:
