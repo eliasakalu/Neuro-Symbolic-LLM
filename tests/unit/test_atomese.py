@@ -224,6 +224,7 @@ class TestValidate:
         "expression",
         [
             "(Has dog invalid-symbol!)",
+            "(Has dog $1invalid)",
             "(Has dog $)",
             "(Has dog $1)",
         ],
@@ -241,6 +242,7 @@ class TestValidate:
             "(Has dog $lowercase)",
             "(Has dog $person)",
             "(Has dog $something_1)",
+            "(Has dog $_local)",
             "(Has dog $X)",
         ],
     )

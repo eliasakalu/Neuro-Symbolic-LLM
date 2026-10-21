@@ -20,3 +20,14 @@ def test_can_select_named_profile() -> None:
     assert profile.name == "ollama_qwen3_8b"
     assert profile.provider == "ollama"
     assert profile.model
+
+
+def test_catalog_ollama_profile_is_explicit_and_legacy_profile_is_unchanged() -> None:
+    legacy = load_model_profile(profile_name="ollama")
+    catalog = load_model_profile(profile_name="ollama_catalog")
+
+    assert legacy.model == catalog.model
+    assert "think" not in legacy.settings
+    assert "temperature" not in legacy.settings
+    assert catalog.settings["think"] is False
+    assert catalog.settings["temperature"] == 0.0

@@ -1,203 +1,235 @@
-"""Tests for the semantic-parser command-line interface."""
-
-from __future__ import annotations
+"""Production commands share one document exporter and one training target."""
 
 import json
-from pathlib import Path
-from typing import Any
 
 import pytest
 
-from parser.grammar.atomese import parse_atom
-from parser.semantic import cli
-from parser.semantic.schema import SemanticParseResult
+from parser.semantic import cli, model_config
+from parser.semantic.backends import CallableBackend
+from tests.semantic_fixtures import pair, target
 
 
-class FakeParser:
-    provider_name = "fake"
-    model_name = "fake-model"
-    prompt_version = "2.0.0"
+@pytest.fixture
+def backend(monkeypatch):
+    calls = []
 
-    def parse(self, sentence: str, context: str = ""):
-        del sentence, context
-        return [parse_atom("(Has dog fur)")]
+    def generate(*, prompt, model):
+        calls.append(prompt)
+        text = prompt.rsplit("<source_text>\n", 1)[1].split("\n</source_text>", 1)[0]
+        return json.dumps(target(text))
 
-    def generate_structured(self, sentence: str) -> SemanticParseResult:
-        return SemanticParseResult.model_validate(
+    monkeypatch.setattr(
+        model_config, "create_backend", lambda profile: CallableBackend(generate)
+    )
+    return calls
+
+
+def test_parse_defaults_to_document_json(backend, capsys):
+    assert cli.main(["parse", "Mira left."]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["contract_version"] == "semantic-document-v1"
+    assert result["assertions"][0]["predicate"] == "Event"
+    assert len(backend) == 1
+
+
+def test_parse_metta_is_only_a_derived_view(backend, capsys):
+    assert cli.main(["parse", "Mira left.", "--format", "metta"]) == 0
+    assert "Evaluation" in capsys.readouterr().out
+    assert len(backend) == 1
+
+
+@pytest.mark.parametrize("command", ["build-dataset", "export-documents"])
+def test_dataset_commands_export_the_same_target(tmp_path, backend, command):
+    source, docs, labels = (
+        tmp_path / "sources.txt",
+        tmp_path / "docs.jsonl",
+        tmp_path / "pairs.jsonl",
+    )
+    source.write_text("Mira left.\n", encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                command,
+                "--input",
+                str(source),
+                "--output",
+                str(docs),
+                "--student-pairs-output",
+                str(labels),
+                "--rejected-output",
+                str(tmp_path / "rejected.jsonl"),
+            ]
+        )
+        == 0
+    )
+    document = json.loads(docs.read_text(encoding="utf-8"))
+    student_pair = json.loads(labels.read_text(encoding="utf-8"))
+    assert (
+        document["contract_version"]
+        == student_pair["contract_version"]
+        == "semantic-document-v1"
+    )
+    assert len(backend) == 1
+
+
+def test_manifest_source_metadata_survives_into_training_pair(tmp_path, backend):
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        json.dumps(
             {
-                "assertions": [
-                    {
-                        "predicate": "Has",
-                        "relation": None,
-                        "arguments": [
-                            {"value": "dog", "role": "owner"},
-                            {"value": "fur", "role": "possessed"},
-                        ],
-                        "fallback": False,
-                        "polarity": "positive",
-                        "confidence": 0.99,
-                        "source_span": sentence,
-                        "alternatives": [],
-                    }
-                ]
+                "text": "Mira left.",
+                "source_dataset": "pilot",
+                "source_domain": "narrative",
             }
         )
-
-    def render_metta(self, result: SemanticParseResult) -> list[str]:
-        del result
-        return ["(Has dog fur)"]
-
-    def validate_rendered_metta(self, expressions: list[str]):
-        return [parse_atom(expression) for expression in expressions]
-
-
-def test_parse_command_prints_metta(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(
-        cli,
-        "build_reference_semantic_parser",
-        lambda *args, **kwargs: FakeParser(),
+        + "\n",
+        encoding="utf-8",
     )
-
-    exit_code = cli.main(["parse", "A dog has fur."])
-
-    assert exit_code == 0
-    assert capsys.readouterr().out == "(Has dog fur)\n"
-
-
-def test_dataset_command_rejects_input_output_collision(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    input_path = tmp_path / "sentences.txt"
-    input_path.write_text("A dog has fur.\n", encoding="utf-8")
-
-    exit_code = cli.main(
-        [
-            "build-dataset",
-            "--input",
-            str(input_path),
-            "--output",
-            str(input_path),
-        ]
-    )
-
-    assert exit_code == 1
-    assert "paths must differ" in capsys.readouterr().err
-
-
-def test_dataset_command_rejects_shared_output_paths(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    input_path = tmp_path / "sentences.txt"
-    output_path = tmp_path / "dataset.jsonl"
-    input_path.write_text("A dog has fur.\n", encoding="utf-8")
-
-    exit_code = cli.main(
-        [
-            "build-dataset",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-            "--rejected-output",
-            str(output_path),
-        ]
-    )
-
-    assert exit_code == 1
-    assert "paths must differ" in capsys.readouterr().err
-
-
-def test_dataset_command_writes_both_outputs(
-    monkeypatch,
-    tmp_path: Path,
-    capsys,
-) -> None:
-    monkeypatch.setattr(
-        cli,
-        "build_reference_semantic_parser",
-        lambda *args, **kwargs: FakeParser(),
-    )
-    input_path = tmp_path / "sentences.txt"
-    output_path = tmp_path / "dataset.jsonl"
-    input_path.write_text("A dog has fur.\n", encoding="utf-8")
-
-    exit_code = cli.main(
-        [
-            "build-dataset",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-            "--include-metta",
-        ]
-    )
-
-    assert exit_code == 0
-    assert '"predicate": "Has"' in output_path.read_text(encoding="utf-8")
-    rejected_path = tmp_path / "dataset.rejected.jsonl"
-    assert rejected_path.read_text(encoding="utf-8") == ""
-    assert "Accepted: 1" in capsys.readouterr().out
-
-
-def test_help_explains_command_options(capsys) -> None:
-    parser = cli.build_argument_parser()
-
-    try:
-        parser.parse_args(["build-dataset", "--help"])
-    except SystemExit as error:
-        assert error.code == 0
-
-    help_output = capsys.readouterr().out
-    assert "one sentence per line" in help_output
-    assert "accepted structured records" in help_output
-    assert "derived MeTTa expressions" in help_output
-
-
-@pytest.mark.parametrize("filename", ["train.jsonl", "validation.jsonl", "test.jsonl"])
-def test_split_rejects_input_output_collision(tmp_path, capsys, filename):
-    source = tmp_path / filename
-    content = '{"input": "hello", "label": "{}"}\n'
-    source.write_text(content)
+    docs, labels = tmp_path / "docs.jsonl", tmp_path / "pairs.jsonl"
     assert (
-        cli.main(["split-pairs", "--input", str(source), "--output-dir", str(tmp_path)])
+        cli.main(
+            [
+                "build-dataset",
+                "--input",
+                str(source),
+                "--output",
+                str(docs),
+                "--student-pairs-output",
+                str(labels),
+                "--rejected-output",
+                str(tmp_path / "rejected.jsonl"),
+            ]
+        )
+        == 0
+    )
+    record = json.loads(labels.read_text(encoding="utf-8"))
+    assert record["source_dataset"] == "pilot"
+    assert record["source_domain"] == "narrative"
+    assert json.loads(docs.read_text(encoding="utf-8"))["corpus_id"] == "pilot"
+
+
+@pytest.mark.parametrize("collision", ["input", "rejected", "labels"])
+def test_export_refuses_path_collisions_without_data_loss(tmp_path, backend, collision):
+    source, docs = tmp_path / "source.txt", tmp_path / "docs.jsonl"
+    source.write_text("Mira left.\n", encoding="utf-8")
+    rejected, labels = tmp_path / "rejected.jsonl", tmp_path / "pairs.jsonl"
+    if collision == "input":
+        docs = source
+    elif collision == "rejected":
+        rejected = docs
+    else:
+        labels = docs
+    assert (
+        cli.main(
+            [
+                "build-dataset",
+                "--input",
+                str(source),
+                "--output",
+                str(docs),
+                "--student-pairs-output",
+                str(labels),
+                "--rejected-output",
+                str(rejected),
+            ]
+        )
         == 1
     )
-    assert "paths must differ" in capsys.readouterr().err
-    assert source.read_text() == content
+    assert source.read_text(encoding="utf-8") == "Mira left.\n"
+    assert backend == []
 
 
-@pytest.mark.parametrize("content", ["null", '{"input": null}', "{broken"])
-def test_split_reports_invalid_line_without_writing(tmp_path, capsys, content):
+def test_help_supports_windows_encoding():
+    assert cli.build_argument_parser().format_help().encode("cp1252")
+
+
+def test_legacy_target_is_not_an_active_choice():
+    with pytest.raises(SystemExit):
+        cli.build_argument_parser().parse_args(
+            ["build-dataset", "--target", "legacy-semantic-v1"]
+        )
+
+
+def test_split_validates_labels_and_writes_disjoint_sources(tmp_path):
     source = tmp_path / "pairs.jsonl"
-    source.write_text("\n" + content + "\n")
-    output = tmp_path / "splits"
-    assert (
-        cli.main(["split-pairs", "--input", str(source), "--output-dir", str(output)])
-        == 1
+    source.write_text(
+        "".join(json.dumps(pair(f"Source {i}.")) + "\n" for i in range(10)),
+        encoding="utf-8",
     )
-    assert f"{source}:2" in capsys.readouterr().err
-    assert not output.exists()
-
-
-def test_split_command_writes_disjoint_files(tmp_path):
-    source = tmp_path / "pairs.jsonl"
-    pairs = [{"input": str(i), "label": "{}"} for i in range(10)]
-    source.write_text("\n".join(json.dumps(pair) for pair in pairs + pairs))
     output = tmp_path / "splits"
     assert (
         cli.main(["split-pairs", "--input", str(source), "--output-dir", str(output)])
         == 0
     )
     splits = [
-        [json.loads(line) for line in (output / name).read_text().splitlines()]
+        [
+            json.loads(line)
+            for line in (output / name).read_text(encoding="utf-8").splitlines()
+        ]
         for name in ("train.jsonl", "validation.jsonl", "test.jsonl")
     ]
-    assert [len(split) for split in splits] == [8, 1, 1]
-    assert sorted(pair["input"] for split in splits for pair in split) == [
-        str(i) for i in range(10)
-    ]
+    assert [len(items) for items in splits] == [8, 1, 1]
+    from parser.semantic.dataset import verify_split_overlap
+
+    verify_split_overlap(*splits)
+
+
+@pytest.mark.parametrize("record", [None, [], {"input": "Dog", "label": "{}"}])
+def test_split_refuses_old_or_invalid_labels_before_writing(tmp_path, record):
+    source = tmp_path / "pairs.jsonl"
+    source.write_text(json.dumps(record), encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "split-pairs",
+                "--input",
+                str(source),
+                "--output-dir",
+                str(tmp_path / "splits"),
+            ]
+        )
+        == 1
+    )
+    assert not (tmp_path / "splits").exists()
+
+
+def test_e2e_never_reuses_an_existing_run(tmp_path):
+    assert (
+        cli.main(
+            [
+                "e2e",
+                "--input",
+                str(tmp_path / "source.txt"),
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+
+
+def test_train_command_passes_existing_training_controls(monkeypatch, tmp_path):
+    from parser.student import train as training
+
+    options = []
+    monkeypatch.setattr(training, "train", lambda **kwargs: options.append(kwargs))
+    assert (
+        cli.main(
+            [
+                "train-student",
+                "--train-file",
+                str(tmp_path / "train.jsonl"),
+                "--val-file",
+                str(tmp_path / "val.jsonl"),
+                "--method",
+                "lora",
+            ]
+        )
+        == 0
+    )
+    assert options[0]["method"] == "lora"
+    assert options[0]["val_file"].endswith("val.jsonl")
+    assert options[0]["output_dir"] is None
 
 
 def write_checkpoint(path):
@@ -217,75 +249,6 @@ def write_checkpoint(path):
         GPT2Config(vocab_size=2, n_embd=8, n_layer=1, n_head=1, n_positions=16)
     )
     model.save_pretrained(path)
-
-
-@pytest.mark.parametrize("existing", ["missing", "empty", "complete"])
-def test_e2e_trains_on_splits_and_uses_held_out_inputs(monkeypatch, tmp_path, existing):
-    import sys
-    from types import SimpleNamespace
-
-    monkeypatch.chdir(tmp_path)
-    data = tmp_path / "data"
-    data.mkdir()
-    (data / "teacher_structured.jsonl").write_text("", encoding="utf-8")
-    label = FakeParser().generate_structured("Dog").model_dump_json()
-    pairs = [{"input": str(i), "label": label} for i in range(20)]
-    (data / "train_pairs.jsonl").write_text(
-        "\n".join(json.dumps(pair) for pair in pairs), encoding="utf-8"
-    )
-    calls = []
-    inferred = []
-    model_dir = tmp_path / "model"
-    if existing == "empty":
-        model_dir.mkdir()
-    elif existing == "complete":
-        write_checkpoint(model_dir)
-
-    def train(**kwargs):
-        calls.append(kwargs)
-        write_checkpoint(Path(kwargs["output_dir"]))
-
-    monkeypatch.setitem(
-        sys.modules, "parser.student.train", SimpleNamespace(train=train)
-    )
-    monkeypatch.setattr(
-        cli,
-        "DistilledSemanticParser",
-        SimpleNamespace(
-            from_pretrained=lambda _: SimpleNamespace(
-                parse=lambda sentence: inferred.append(sentence)
-                or FakeParser().parse(sentence)
-            )
-        ),
-    )
-    assert cli.main(["e2e", "--output-dir", str(tmp_path / "model")]) == 0
-    if existing == "complete":
-        assert calls == []
-    else:
-        assert len(calls) == 1
-        assert calls[0]["train_file"] == "data/splits/train.jsonl"
-        assert calls[0]["val_file"] == "data/splits/validation.jsonl"
-    test_pairs = [
-        json.loads(line)
-        for line in (data / "splits/test.jsonl").read_text().splitlines()
-    ]
-    assert inferred == [pair["input"] for pair in test_pairs]
-
-
-def test_e2e_missing_input_returns_error(tmp_path, capsys):
-    assert cli.main(["e2e", "--input", str(tmp_path / "missing.txt")]) == 1
-    assert "missing.txt" in capsys.readouterr().err
-
-
-def test_convert_rejects_input_output_collision(tmp_path, capsys):
-    source = tmp_path / "pairs.jsonl"
-    source.write_text("original", encoding="utf-8")
-    assert (
-        cli.main(["convert-to-pairs", "--input", str(source), "--output", str(source)])
-        == 1
-    )
-    assert source.read_text() == "original"
-    assert "paths must differ" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -355,392 +318,5 @@ def test_checkpoint_accepts_pytorch_weights(tmp_path):
     assert cli._checkpoint_error(tmp_path) is None
 
 
-def test_e2e_skip_training_rejects_empty_checkpoint_before_teacher(
-    tmp_path, monkeypatch, capsys
-):
-    monkeypatch.chdir(tmp_path)
-    model = tmp_path / "model"
-    model.mkdir()
-    assert cli.main(["e2e", "--skip-training", "--output-dir", str(model)]) == 1
-    assert "complete model checkpoint is required" in capsys.readouterr().err
-    assert not (tmp_path / "data").exists()
-
-
-def test_distill_rejects_empty_checkpoint(tmp_path, capsys):
-    assert cli.main(["distill", "Dog", "--model-dir", str(tmp_path)]) == 1
-    assert "complete model checkpoint is required" in capsys.readouterr().err
-
-
-@pytest.fixture
-def cached_e2e(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
-    monkeypatch.chdir(tmp_path)
-    splits = tmp_path / "data/splits"
-    splits.mkdir(parents=True)
-    for name in ("teacher_structured.jsonl", "train_pairs.jsonl"):
-        (splits.parent / name).write_text("", encoding="utf-8")
-    paths = [
-        splits / name for name in ("train.jsonl", "validation.jsonl", "test.jsonl")
-    ]
-    for index, path in enumerate(paths):
-        path.write_text(
-            json.dumps(
-                {
-                    "input": str(index),
-                    "label": FakeParser().generate_structured("Dog").model_dump_json(),
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    model_checks = []
-    monkeypatch.setattr(
-        cli, "_checkpoint_error", lambda path: model_checks.append(path)
-    )
-    monkeypatch.setattr(
-        cli,
-        "DistilledSemanticParser",
-        SimpleNamespace(from_pretrained=lambda _: FakeParser()),
-    )
-    return paths, model_checks
-
-
-@pytest.mark.parametrize("left,right", [(0, 1), (0, 2), (1, 2)])
-def test_cached_splits_reject_overlap_before_model_use(cached_e2e, capsys, left, right):
-    paths, model_checks = cached_e2e
-    paths[right].write_text(
-        json.dumps({"input": f" {left} ", "label": "{}"}), encoding="utf-8"
-    )
-    assert cli.main(["e2e"]) == 1
-    assert "overlap" in capsys.readouterr().err
-    assert model_checks == []
-
-
-@pytest.mark.parametrize(
-    "bad_record",
-    [
-        "{broken",
-        "null",
-        "[]",
-        '{"input": null}',
-        '{"input": "Dog", "label": null}',
-        '{"input": " ", "label": "{}"}',
-    ],
-)
-def test_cached_splits_report_invalid_record_location(cached_e2e, capsys, bad_record):
-    paths, model_checks = cached_e2e
-    paths[1].write_text("\n" + bad_record + "\n", encoding="utf-8")
-    assert cli.main(["e2e"]) == 1
-    assert "validation.jsonl:2" in capsys.readouterr().err
-    assert model_checks == []
-
-
-def test_valid_cached_splits_are_reused_without_changes(cached_e2e, capsys):
-    paths, model_checks = cached_e2e
-    original = [path.read_bytes() for path in paths]
-    assert cli.main(["e2e"]) == 0
-    assert "Using existing dataset splits" in capsys.readouterr().out
-    assert model_checks
-    assert [path.read_bytes() for path in paths] == original
-
-
-@pytest.mark.parametrize(
-    "prediction, matches",
-    [
-        ("(Has dog fur)", True),
-        ("(Has fur dog)", False),
-        ("(Not (Has dog fur))", False),
-        ("(Inheritance dog animal)", False),
-    ],
-)
-def test_e2e_reports_relation_accuracy(
-    cached_e2e, monkeypatch, capsys, prediction, matches
-):
-    monkeypatch.setattr(
-        FakeParser, "parse", lambda self, sentence: [parse_atom(prediction)]
-    )
-    assert cli.main(["e2e"]) == 0
-    output = capsys.readouterr().out
-    assert "Results: 1/1 valid" in output
-    assert f"Exact relation match: {int(matches)}/1" in output
-    assert ("[MATCH]" if matches else "[MISMATCH]") in output
-
-
-def test_e2e_prediction_failure_does_not_report_completion(
-    cached_e2e, monkeypatch, capsys
-):
-    def fail(self, sentence):
-        raise ValueError("bad prediction")
-
-    monkeypatch.setattr(FakeParser, "parse", fail)
-    assert cli.main(["e2e"]) == 1
-    output = capsys.readouterr()
-    assert "Exact relation match: 0/1" in output.out
-    assert "PIPELINE COMPLETE" not in output.out
-    assert "prediction failures" in output.err
-
-
-def test_e2e_rejects_invalid_expected_label(cached_e2e, capsys):
-    paths, _ = cached_e2e
-    paths[2].write_text(json.dumps({"input": "Dog", "label": "{}"}), encoding="utf-8")
-    assert cli.main(["e2e"]) == 1
-    assert "Invalid test label" in capsys.readouterr().err
-
-
-def test_e2e_match_ignores_assertion_order_and_confidence(
-    cached_e2e, monkeypatch, capsys
-):
-    import copy
-
-    paths, _ = cached_e2e
-    target = FakeParser().generate_structured("Dog").model_dump(mode="json")
-    second = copy.deepcopy(target["assertions"][0])
-    second["arguments"][0]["value"] = "cat"
-    second["confidence"] = 0.5
-    target["assertions"].append(second)
-    paths[2].write_text(
-        json.dumps({"input": "Dog and cat", "label": json.dumps(target)}),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        FakeParser,
-        "parse",
-        lambda self, sentence: [
-            parse_atom("(Has cat fur)"),
-            parse_atom("(Has dog fur)"),
-        ],
-    )
-    assert cli.main(["e2e"]) == 0
-    assert "Exact relation match: 1/1" in capsys.readouterr().out
-
-
-def test_e2e_rejects_empty_test_set(cached_e2e, capsys):
-    paths, _ = cached_e2e
-    paths[2].write_text("", encoding="utf-8")
-    assert cli.main(["e2e"]) == 1
-    assert "No test examples" in capsys.readouterr().err
-
-
-def test_dataset_command_accepts_jsonl_manifest_with_provenance(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(
-        cli,
-        "build_reference_semantic_parser",
-        lambda *args, **kwargs: FakeParser(),
-    )
-
-    input_path = tmp_path / "pilot.jsonl"
-    output_path = tmp_path / "dataset.jsonl"
-
-    input_path.write_text(
-        json.dumps(
-            {
-                "text": "A dog has fur.",
-                "source_dataset": "proofwriter",
-                "source_domain": "logical_reasoning",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    exit_code = cli.main(
-        [
-            "build-dataset",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-        ]
-    )
-
-    assert exit_code == 0
-
-    record = json.loads(output_path.read_text(encoding="utf-8"))
-
-    assert record["text"] == "A dog has fur."
-    assert record["source_dataset"] == "proofwriter"
-    assert record["source_domain"] == "logical_reasoning"
-
-
-def test_dataset_command_plain_text_input_still_works(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(
-        cli,
-        "build_reference_semantic_parser",
-        lambda *args, **kwargs: FakeParser(),
-    )
-
-    input_path = tmp_path / "sentences.txt"
-    output_path = tmp_path / "dataset.jsonl"
-
-    input_path.write_text(
-        "A dog has fur.\n",
-        encoding="utf-8",
-    )
-
-    exit_code = cli.main(
-        [
-            "build-dataset",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-        ]
-    )
-
-    assert exit_code == 0
-
-    record = json.loads(output_path.read_text(encoding="utf-8"))
-
-    assert record["text"] == "A dog has fur."
-    assert record["source_dataset"] is None
-    assert record["source_domain"] is None
-
-
-def test_dataset_command_rejects_invalid_jsonl(
-    monkeypatch,
-    tmp_path: Path,
-    capsys,
-) -> None:
-    monkeypatch.setattr(
-        cli,
-        "build_reference_semantic_parser",
-        lambda *args, **kwargs: FakeParser(),
-    )
-
-    input_path = tmp_path / "pilot.jsonl"
-    output_path = tmp_path / "dataset.jsonl"
-
-    input_path.write_text(
-        "{broken\n",
-        encoding="utf-8",
-    )
-
-    exit_code = cli.main(
-        [
-            "build-dataset",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-        ]
-    )
-
-    assert exit_code == 1
-    assert f"{input_path}:1" in capsys.readouterr().err
-
-
-def test_dataset_command_rejects_non_string_jsonl_text(
-    monkeypatch,
-    tmp_path: Path,
-    capsys,
-) -> None:
-    monkeypatch.setattr(
-        cli,
-        "build_reference_semantic_parser",
-        lambda *args, **kwargs: FakeParser(),
-    )
-
-    input_path = tmp_path / "pilot.jsonl"
-    output_path = tmp_path / "dataset.jsonl"
-
-    input_path.write_text(
-        json.dumps(
-            {
-                "text": 123,
-                "source_dataset": "proofwriter",
-                "source_domain": "logical_reasoning",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    exit_code = cli.main(
-        [
-            "build-dataset",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-        ]
-    )
-
-    assert exit_code == 1
-    assert "'text' must be a string" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("source_dataset", 123),
-        ("source_domain", []),
-    ],
-)
-def test_dataset_command_rejects_invalid_provenance_types(
-    monkeypatch,
-    tmp_path: Path,
-    capsys,
-    field,
-    value,
-) -> None:
-    monkeypatch.setattr(
-        cli,
-        "build_reference_semantic_parser",
-        lambda *args, **kwargs: FakeParser(),
-    )
-
-    input_path = tmp_path / "pilot.jsonl"
-    output_path = tmp_path / "dataset.jsonl"
-
-    record = {
-        "text": "A dog has fur.",
-        "source_dataset": "proofwriter",
-        "source_domain": "logical_reasoning",
-    }
-    record[field] = value
-
-    input_path.write_text(
-        json.dumps(record) + "\n",
-        encoding="utf-8",
-    )
-
-    exit_code = cli.main(
-        [
-            "build-dataset",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-        ]
-    )
-
-    assert exit_code == 1
-    assert f"'{field}' must be a string or null" in capsys.readouterr().err
-
-
-def structured_rule_output(
-    *,
-    antecedents: list[dict[str, Any]],
-    consequents: list[dict[str, Any]],
-    source_span: str,
-) -> str:
-    """Serialize fake teacher output containing one conditional rule."""
-    return json.dumps(
-        {
-            "assertions": [],
-            "rules": [
-                {
-                    "antecedents": antecedents,
-                    "consequents": consequents,
-                    "source_span": source_span,
-                }
-            ],
-        }
-    )
+def test_distill_requires_real_checkpoint(tmp_path):
+    assert cli.main(["distill", "--model-dir", str(tmp_path), "Mira left."]) == 1

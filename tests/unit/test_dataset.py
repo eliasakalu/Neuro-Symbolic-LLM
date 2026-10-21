@@ -1,741 +1,108 @@
-"""Tests for structured semantic distillation datasets."""
-
-from __future__ import annotations
+"""Canonical teacher documents, factuality preservation and dataset isolation."""
 
 import json
-from typing import Any
 
 import pytest
 
+from parser.ontology.catalog import load_ontology_catalog
 from parser.semantic import (
     CallableBackend,
     ReferenceSemanticParser,
     SemanticDatasetBuilder,
     SemanticParserConfig,
 )
-from parser.semantic.dataset import split_pairs, verify_split_overlap
+from parser.semantic.catalog_student import validate_catalog_student_pair
+from parser.semantic.dataset import (
+    split_pairs,
+    structured_to_pairs,
+    verify_split_overlap,
+)
+from tests.semantic_fixtures import pair, target
 
 
-def assertion(
-    *,
-    predicate: str,
-    values: tuple[str, ...],
-    roles: tuple[str, ...],
-    relation: str | None = None,
-    fallback: bool = False,
-    factuality: str = "asserted",
-) -> dict[str, Any]:
-    """Return one valid structured assertion."""
-    return {
-        "predicate": predicate,
-        "relation": relation,
-        "arguments": [
-            {"value": value, "role": role, "type": None}
-            for value, role in zip(values, roles, strict=True)
-        ],
-        "fallback": fallback,
-        "polarity": "positive",
-        "factuality": factuality,
-        "confidence": 0.99,
-        "source_span": "supporting text",
-        "alternatives": [],
-    }
-
-
-def make_parser() -> ReferenceSemanticParser:
-    outputs = {
-        "A dog is an animal.": {
-            "assertions": [
-                assertion(
-                    predicate="Inheritance",
-                    values=("dog", "animal"),
-                    roles=("instance", "class"),
-                )
-            ]
-        },
-        "A dog can bark.": {
-            "assertions": [
-                assertion(
-                    predicate="Inheritance",
-                    values=("dog", "animal"),
-                    roles=("instance", "class"),
-                ),
-                assertion(
-                    predicate="CanDo",
-                    values=("dog", "bark"),
-                    roles=("agent", "action"),
-                ),
-            ]
-        },
-        "The researcher collected the data during the experiment.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="collect",
-                    values=("researcher", "data"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                ),
-                assertion(
-                    predicate="During",
-                    values=("collect", "experiment"),
-                    roles=("event_or_state", "time_or_event"),
-                ),
-            ]
-        },
-        "The engineer designed the bridge in 2025.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="design",
-                    values=("engineer", "bridge"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                ),
-                assertion(
-                    predicate="OccursAt",
-                    values=("design", "2025"),
-                    roles=("event_or_state", "time"),
-                ),
-            ]
-        },
-        "The doctor examined the patient at the hospital.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="examine",
-                    values=("doctor", "patient"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                ),
-                assertion(
-                    predicate="OccursIn",
-                    values=("examine", "hospital"),
-                    roles=("event_or_state", "location"),
-                ),
-            ]
-        },
-        "I think Paris is beautiful.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="think",
-                    values=("I", "Paris_is_beautiful"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                    factuality="opinion",
-                )
-            ]
-        },
-        "Paris might become larger.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="become",
-                    values=("Paris", "larger"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                    factuality="speculative",
-                )
-            ]
-        },
-        "If it rains, the road may become slippery.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="rain",
-                    values=("it",),
-                    roles=("agent",),
-                    fallback=True,
-                    factuality="hypothetical",
-                ),
-                assertion(
-                    predicate="Evaluation",
-                    relation="become",
-                    values=("road", "slippery"),
-                    roles=("patient", "state"),
-                    fallback=True,
-                    factuality="hypothetical",
-                ),
-            ]
-        },
-        "The company announced a product that might succeed.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="announce",
-                    values=("company", "product"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                    factuality="asserted",
-                ),
-                assertion(
-                    predicate="Evaluation",
-                    relation="succeed",
-                    values=("product",),
-                    roles=("agent",),
-                    fallback=True,
-                    factuality="speculative",
-                ),
-            ]
-        },
-        # Mixed factuality regression cases
-        "The company launched a product that might succeed.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="launch",
-                    values=("company", "product"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                    factuality="asserted",
-                ),
-                assertion(
-                    predicate="Evaluation",
-                    relation="succeed",
-                    values=("product",),
-                    roles=("agent",),
-                    fallback=True,
-                    factuality="speculative",
-                ),
-            ]
-        },
-        "Alice owns a car that she thinks is beautiful.": {
-            "assertions": [
-                assertion(
-                    predicate="Has",
-                    values=("Alice", "car"),
-                    roles=("owner", "possessed"),
-                    factuality="asserted",
-                ),
-                assertion(
-                    predicate="Evaluation",
-                    relation="think",
-                    values=("Alice", "car_is_beautiful"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                    factuality="opinion",
-                ),
-            ]
-        },
-        "The scientist published the results, but they could be wrong.": {
-            "assertions": [
-                assertion(
-                    predicate="Evaluation",
-                    relation="publish",
-                    values=("scientist", "results"),
-                    roles=("agent", "patient"),
-                    fallback=True,
-                    factuality="asserted",
-                ),
-                assertion(
-                    predicate="Evaluation",
-                    relation="be_wrong",
-                    values=("results",),
-                    roles=("patient",),
-                    fallback=True,
-                    factuality="speculative",
-                ),
-            ]
-        },
-    }
-
-    for sentence, payload in outputs.items():
-        for item in payload["assertions"]:
-            item["source_span"] = sentence
-
-    def generate(
-        *,
-        prompt: str,
-        model: str,
-    ) -> str:
-        del model
-
-        sentence = (
-            prompt.rsplit(
-                "<sentence>\n",
-                maxsplit=1,
-            )[-1]
-            .split(
-                "\n</sentence>",
-                maxsplit=1,
-            )[0]
-            .strip()
-        )
-
-        return json.dumps(
-            outputs.get(
-                sentence,
-                {
-                    "assertions": [],
-                },
-            )
-        )
+def make_parser(payload=None):
+    def generate(*, prompt, model):
+        text = prompt.rsplit("<source_text>\n", 1)[1].split("\n</source_text>", 1)[0]
+        return json.dumps(payload if payload is not None else target(text))
 
     return ReferenceSemanticParser(
-        backend=CallableBackend(
-            generate,
-            provider_name="fake-teacher",
-        ),
-        config=SemanticParserConfig(
-            model_name="teacher-model",
-            prompt_version="2.0.0",
-        ),
+        backend=CallableBackend(generate, provider_name="fixture"),
+        config=SemanticParserConfig(model_name="fixture"),
     )
 
 
-class TestSemanticDatasetBuilder:
-    def test_separates_accepted_and_rejected_examples(self) -> None:
-        builder = SemanticDatasetBuilder(make_parser())
+def test_builder_preserves_exact_source_and_outputs_only_documents(tmp_path):
+    builder = SemanticDatasetBuilder(make_parser())
+    accepted, rejected = builder.generate(["  Mira left.  ", "  "])
+    assert len(accepted) == len(rejected) == 1
+    assert accepted[0].source_text == "  Mira left.  "
+    assert accepted[0].contract_version == "semantic-document-v1"
+    path = tmp_path / "nested" / "documents.jsonl"
+    builder.write_jsonl(accepted, path)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["source_text"] == "  Mira left.  "
+    assert "target" not in record
+    assert record["parser"]["provider"] == "fixture"
+    rejected_path = tmp_path / "rejected.jsonl"
+    builder.write_rejected_jsonl(rejected, rejected_path)
+    assert json.loads(rejected_path.read_text(encoding="utf-8"))["text"] == "  "
 
-        accepted, rejected = builder.generate(
-            [
-                "A dog is an animal.",
-                "Unknown statement.",
-                "   ",
-            ]
-        )
 
-        assert len(accepted) == 1
-
-        assert accepted[0].target["assertions"][0]["predicate"] == "Inheritance"
-
-        assert accepted[0].target["assertions"][0]["factuality"] == "asserted"
-
-        assert accepted[0].metta is None
-        assert accepted[0].teacher_provider == "fake-teacher"
-        assert accepted[0].prompt_version == "2.0.0"
-        assert accepted[0].semantic_contract_version == "1.1.0"
-
-        assert len(rejected) == 2
-
-        assert rejected[0].text == "Unknown statement."
-        assert "invalid structured semantic output" in rejected[0].error
-
-        assert rejected[1].text == "   "
-        assert rejected[1].error == "The sentence cannot be empty"
-
-    def test_preserves_source_dataset_and_domain(self) -> None:
-        builder = SemanticDatasetBuilder(make_parser())
-
-        accepted, rejected = builder.generate(
-            ["A dog is an animal."],
-            source_dataset="proofwriter",
-            source_domain="logical_reasoning",
-        )
-
-        assert rejected == []
-        assert len(accepted) == 1
-        assert accepted[0].source_dataset == "proofwriter"
-        assert accepted[0].source_domain == "logical_reasoning"
-
-    def test_normalizes_text_and_keeps_all_structured_assertions(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(make_parser())
-
-        accepted, rejected = builder.generate(
-            [
-                "  A dog can bark.  ",
-            ]
-        )
-
-        assert rejected == []
-        assert accepted[0].text == "A dog can bark."
-
-        assert [item["predicate"] for item in accepted[0].target["assertions"]] == [
-            "Inheritance",
-            "CanDo",
-        ]
-
-        assert all(
-            item["factuality"] == "asserted"
-            for item in accepted[0].target["assertions"]
-        )
-
-        assert accepted[0].teacher_model == "teacher-model"
-
-    def test_optionally_includes_derived_metta(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            include_metta=True,
-        )
-
-        accepted, rejected = builder.generate(
-            [
-                "A dog can bark.",
-            ]
-        )
-
-        assert rejected == []
-
-        assert accepted[0].metta == (
-            "(Inheritance dog animal)",
-            "(CanDo dog bark)",
-        )
-
-    def test_writes_nested_json_target_without_metta_by_default(
-        self,
-        tmp_path: Any,
-    ) -> None:
-        builder = SemanticDatasetBuilder(make_parser())
-
-        accepted, _ = builder.generate(
-            [
-                "A dog is an animal.",
-            ],
-            source_dataset="proofwriter",
-            source_domain="logical_reasoning",
-        )
-
-        output_path = tmp_path / "dataset.jsonl"
-
-        builder.write_jsonl(
-            accepted,
-            output_path,
-        )
-
-        record = json.loads(output_path.read_text(encoding="utf-8").splitlines()[0])
-
-        assert record["text"] == "A dog is an animal."
-
-        assert record["target"]["assertions"][0]["predicate"] == "Inheritance"
-
-        assert record["target"]["assertions"][0]["factuality"] == "asserted"
-
-        assert "metta" not in record
-
-        assert record["teacher_model"] == "teacher-model"
-        assert record["semantic_contract_version"] == "1.1.0"
-        assert record["source_dataset"] == "proofwriter"
-        assert record["source_domain"] == "logical_reasoning"
-
-    def test_writes_an_empty_file_and_creates_parent_directories(
-        self,
-        tmp_path: Any,
-    ) -> None:
-        output_path = tmp_path / "nested" / "empty.jsonl"
-
-        SemanticDatasetBuilder.write_jsonl(
-            [],
-            output_path,
-        )
-
-        assert output_path.exists()
-
-        assert output_path.read_text(encoding="utf-8") == ""
-
-    def test_writes_rejected_records(
-        self,
-        tmp_path: Any,
-    ) -> None:
-        builder = SemanticDatasetBuilder(make_parser())
-
-        _, rejected = builder.generate(
-            [
-                "Unknown statement.",
-            ]
-        )
-
-        output_path = tmp_path / "rejected.jsonl"
-
-        builder.write_rejected_jsonl(
-            rejected,
-            output_path,
-        )
-
-        record = json.loads(output_path.read_text(encoding="utf-8"))
-
-        assert record["text"] == "Unknown statement."
-
-        assert "invalid structured semantic output" in record["error"]
-
-    @pytest.mark.parametrize(
-        "sentence,expected_predicates,expected_metta",
-        [
-            (
-                "The researcher collected the data during the experiment.",
-                [
-                    "Evaluation",
-                    "During",
-                ],
-                (
-                    "(Evaluation collect (List researcher data))",
-                    "(During collect experiment)",
-                ),
-            ),
-            (
-                "The engineer designed the bridge in 2025.",
-                [
-                    "Evaluation",
-                    "OccursAt",
-                ],
-                (
-                    "(Evaluation design (List engineer bridge))",
-                    "(OccursAt design time_2025)",
-                ),
-            ),
-            (
-                "The doctor examined the patient at the hospital.",
-                [
-                    "Evaluation",
-                    "OccursIn",
-                ],
-                (
-                    "(Evaluation examine (List doctor patient))",
-                    "(OccursIn examine hospital)",
-                ),
-            ),
-        ],
+@pytest.mark.parametrize(
+    "factuality", ["asserted", "hypothetical", "opinion", "speculative"]
+)
+def test_builder_retains_each_factuality_without_asserted_only_filter(factuality):
+    payload = target("Mira left.")
+    payload["assertions"][0]["factuality"] = factuality
+    documents, rejected = SemanticDatasetBuilder(make_parser(payload)).generate(
+        ["Mira left."]
     )
-    def test_preserves_event_modifiers_in_dataset(
-        self,
-        sentence: str,
-        expected_predicates: list[str],
-        expected_metta: tuple[str, ...],
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            include_metta=True,
-        )
+    assert not rejected
+    assert documents[0].assertions[0].factuality == factuality
 
-        accepted, rejected = builder.generate(
-            [
-                sentence,
-            ]
-        )
 
-        assert rejected == []
-        assert len(accepted) == 1
+@pytest.mark.parametrize("option", ["include_metta", "asserted_only"])
+def test_lossy_dataset_options_are_rejected(option):
+    with pytest.raises(ValueError, match="preserve factuality"):
+        SemanticDatasetBuilder(make_parser(), **{option: True})
 
-        assertions = accepted[0].target["assertions"]
 
-        assert [item["predicate"] for item in assertions] == expected_predicates
+def test_invalid_model_output_is_quarantined():
+    documents, rejected = SemanticDatasetBuilder(
+        make_parser({"assertions": []})
+    ).generate(["Mira left."])
+    assert not documents
+    assert rejected[0].error
 
-        assert all(item["factuality"] == "asserted" for item in assertions)
 
-        assert accepted[0].metta == expected_metta
+def test_empty_export_creates_parent(tmp_path):
+    path = tmp_path / "nested" / "empty.jsonl"
+    SemanticDatasetBuilder.write_jsonl([], path)
+    assert path.read_text(encoding="utf-8") == ""
 
-    def test_asserted_only_keeps_asserted_assertions(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            asserted_only=True,
-        )
 
-        accepted, rejected = builder.generate(
-            [
-                "A dog is an animal.",
-            ]
-        )
+def test_document_conversion_roundtrips_exactly(tmp_path):
+    catalog = load_ontology_catalog()
+    original_pair = pair()
+    _, _, document = validate_catalog_student_pair(original_pair, catalog=catalog)
+    source, output = tmp_path / "docs.jsonl", tmp_path / "pairs.jsonl"
+    source.write_text(document.canonical_json() + "\n", encoding="utf-8")
+    pairs = structured_to_pairs(str(source), str(output))
+    _, _, restored = validate_catalog_student_pair(pairs[0], catalog=catalog)
+    assert restored.canonical_json() == document.canonical_json()
 
-        assert rejected == []
-        assert len(accepted) == 1
 
-        assertions = accepted[0].target["assertions"]
-
-        assert len(assertions) == 1
-
-        assert assertions[0]["predicate"] == "Inheritance"
-
-        assert assertions[0]["factuality"] == "asserted"
-
-    def test_asserted_only_rejects_opinion_only_sentence(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            asserted_only=True,
-        )
-
-        accepted, rejected = builder.generate(
-            [
-                "I think Paris is beautiful.",
-            ]
-        )
-
-        assert accepted == []
-        assert len(rejected) == 1
-
-        assert rejected[0].text == "I think Paris is beautiful."
-
-        assert rejected[0].error == "No asserted factual assertions"
-
-    def test_asserted_only_rejects_speculative_only_sentence(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            asserted_only=True,
-        )
-
-        accepted, rejected = builder.generate(
-            [
-                "Paris might become larger.",
-            ]
-        )
-
-        assert accepted == []
-        assert len(rejected) == 1
-
-        assert rejected[0].text == "Paris might become larger."
-
-        assert rejected[0].error == "No asserted factual assertions"
-
-    def test_asserted_only_rejects_hypothetical_only_sentence(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            asserted_only=True,
-        )
-
-        accepted, rejected = builder.generate(
-            [
-                "If it rains, the road may become slippery.",
-            ]
-        )
-
-        assert accepted == []
-        assert len(rejected) == 1
-
-        assert rejected[0].error == "No asserted factual assertions"
-
-    def test_asserted_only_keeps_asserted_part_of_mixed_sentence(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            asserted_only=True,
-            include_metta=True,
-        )
-
-        accepted, rejected = builder.generate(
-            [
-                "The company announced a product that might succeed.",
-            ]
-        )
-
-        assert rejected == []
-        assert len(accepted) == 1
-
-        assertions = accepted[0].target["assertions"]
-
-        assert len(assertions) == 1
-
-        assert assertions[0]["predicate"] == "Evaluation"
-
-        assert assertions[0]["relation"] == "announce"
-
-        assert assertions[0]["factuality"] == "asserted"
-
-        assert accepted[0].metta == ("(Evaluation announce (List company product))",)
-
-    def test_default_dataset_keeps_all_factuality_classes(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(make_parser())
-
-        accepted, rejected = builder.generate(
-            [
-                "I think Paris is beautiful.",
-                "Paris might become larger.",
-                "If it rains, the road may become slippery.",
-            ]
-        )
-
-        assert rejected == []
-        assert len(accepted) == 3
-
-        assert accepted[0].target["assertions"][0]["factuality"] == "opinion"
-
-        assert accepted[1].target["assertions"][0]["factuality"] == "speculative"
-
-        assert all(
-            item["factuality"] == "hypothetical"
-            for item in (accepted[2].target["assertions"])
-        )
-
-    def test_asserted_only_keeps_launch_and_filters_speculation(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            asserted_only=True,
-            include_metta=True,
-        )
-
-        accepted, rejected = builder.generate(
-            [
-                "The company launched a product that might succeed.",
-            ]
-        )
-
-        assert rejected == []
-        assert len(accepted) == 1
-
-        assertions = accepted[0].target["assertions"]
-
-        assert len(assertions) == 1
-        assert assertions[0]["relation"] == "launch"
-        assert assertions[0]["factuality"] == "asserted"
-
-        assert accepted[0].metta == ("(Evaluation launch (List company product))",)
-
-    def test_asserted_only_keeps_ownership_and_filters_opinion(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            asserted_only=True,
-            include_metta=True,
-        )
-
-        accepted, rejected = builder.generate(
-            [
-                "Alice owns a car that she thinks is beautiful.",
-            ]
-        )
-
-        assert rejected == []
-        assert len(accepted) == 1
-
-        assertions = accepted[0].target["assertions"]
-
-        assert len(assertions) == 1
-        assert assertions[0]["predicate"] == "Has"
-        assert assertions[0]["factuality"] == "asserted"
-
-        assert accepted[0].metta == ("(Has Alice car)",)
-
-    def test_asserted_only_keeps_publish_and_filters_speculation(
-        self,
-    ) -> None:
-        builder = SemanticDatasetBuilder(
-            make_parser(),
-            asserted_only=True,
-            include_metta=True,
-        )
-
-        accepted, rejected = builder.generate(
-            [
-                "The scientist published the results, but they could be wrong.",
-            ]
-        )
-
-        assert rejected == []
-        assert len(accepted) == 1
-
-        assertions = accepted[0].target["assertions"]
-
-        assert len(assertions) == 1
-        assert assertions[0]["relation"] == "publish"
-        assert assertions[0]["factuality"] == "asserted"
-
-        assert accepted[0].metta == ("(Evaluation publish (List scientist results))",)
+@pytest.mark.parametrize(
+    "record", [None, [], {"text": "Dog", "target": {"assertions": []}}]
+)
+def test_historical_or_malformed_records_do_not_silently_become_labels(
+    tmp_path, record
+):
+    source, output = tmp_path / "source.jsonl", tmp_path / "pairs.jsonl"
+    source.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid document"):
+        structured_to_pairs(str(source), str(output))
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(
@@ -812,39 +179,3 @@ def test_conversion_preserves_source_when_output_aliases_it(tmp_path, alias):
     with pytest.raises(ValueError, match="paths must differ"):
         structured_to_pairs(str(source), str(output))
     assert source.read_bytes() == original
-
-
-def test_conversion_skips_malformed_shapes_and_keeps_valid_record(tmp_path):
-    from parser.semantic.dataset import structured_to_pairs
-
-    source = tmp_path / "source.jsonl"
-
-    output = tmp_path / "output.jsonl"
-
-    target = {
-        "assertions": [
-            assertion(
-                predicate="Has",
-                values=("dog", "fur"),
-                roles=("owner", "possessed"),
-            )
-        ]
-    }
-
-    records = [
-        None,
-        [],
-        42,
-        {"text": None},
-        {"text": []},
-        {"text": "Dog", "target": target},
-    ]
-
-    source.write_text(
-        "\n".join(json.dumps(record) for record in records),
-        encoding="utf-8",
-    )
-    pairs = structured_to_pairs(str(source), str(output))
-
-    assert len(pairs) == 1
-    assert pairs[0]["input"] == "Dog"

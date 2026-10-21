@@ -11,7 +11,6 @@ import torch
 
 from parser.grammar.atomese import LinkAtom
 from parser.semantic import (
-    ALLOWED_PREDICATES,
     ModelGenerationError,
     ReferenceSemanticParser,
     SemanticParseError,
@@ -19,6 +18,7 @@ from parser.semantic import (
 )
 from parser.semantic.schema import SemanticParseResult
 from parser.semantic.semantic_parser import DistilledSemanticParser
+from tests.semantic_fixtures import target, write_checkpoint_metadata
 
 
 def assertion(
@@ -120,36 +120,31 @@ class TestSemanticParserConfig:
 
 
 class TestPrompt:
-    def test_contains_sentence_context_and_predicates(self) -> None:
-        prompt = ReferenceSemanticParser.build_prompt(
-            "It has stores.",
-            context="Apple is a company.",
-        )
+    def test_shared_prompt_contains_exact_source_and_catalog_examples(self):
+        from parser.student.student_prompt import build_student_prompt
 
-        assert "<sentence>\nIt has stores.\n</sentence>" in prompt
-        assert "<context>\nApple is a company.\n</context>" in prompt
-        assert ALLOWED_PREDICATES in prompt
-        assert "On(entity, surface)" in prompt
-        assert "Has(owner, possessed)" in prompt
-
-    def test_requires_json_instead_of_metta(self) -> None:
-        prompt = ReferenceSemanticParser.build_prompt("A dog has fur.")
-
-        assert "Return valid JSON only" in prompt
-        assert "Do not output MeTTa" in prompt
-
-    def test_contains_temporal_and_spatial_modifier_contract(self) -> None:
-        prompt = ReferenceSemanticParser.build_prompt(
-            "The engineer designed the bridge in 2025."
-        )
-
-        assert "OccursAt(event_or_state, time)" in prompt
-        assert "OccursIn(event_or_state, location)" in prompt
-        assert "Temporal and other secondary relations must not replace" in prompt
-        assert "Spatial modifiers must not replace the core event" in prompt
+        prompt = ReferenceSemanticParser.build_prompt("Mira left.", context="Earlier.")
+        assert prompt == build_student_prompt("Mira left.", context="Earlier.")
+        assert "<source_text>\nEarlier.\nMira left.\n</source_text>" in prompt
+        assert "<worked_example>" in prompt
+        assert "Ontology versions:" in prompt
 
 
-class TestReferenceSemanticParser:
+def read_record(parser, sentence, **kwargs):
+    """Exercise the production historical reader without calling a model."""
+    return ReferenceSemanticParser.read_legacy_result(
+        parser._backend.output, sentence=sentence, **kwargs
+    )
+
+
+def read_atoms(parser, sentence, **kwargs):
+    result = read_record(parser, sentence, **kwargs)
+    return ReferenceSemanticParser.validate_rendered_metta(
+        ReferenceSemanticParser.render_metta(result)
+    )
+
+
+class TestHistoricalResultReader:
     def test_generates_normalized_structured_semantics(self) -> None:
         output = structured_output(
             assertion(
@@ -160,19 +155,20 @@ class TestReferenceSemanticParser:
         )
         parser, backend = make_teacher(output)
 
-        result = parser.generate_structured(
+        result = read_record(
+            parser,
             "Apple Computer has retail stores.",
             aliases={"Apple Computer": "Apple"},
         )
 
         assert result.assertions[0].arguments[0].value == "Apple"
         assert result.assertions[0].arguments[1].value == "retail_stores"
-        assert backend.calls[0]["model"] == "teacher-model"
+        assert backend.calls == []
 
     def test_returns_validated_link_atom(self) -> None:
         parser, _ = make_teacher()
 
-        result = parser.parse("A dog has fur.")
+        result = read_atoms(parser, "A dog has fur.")
 
         assert len(result) == 1
         assert isinstance(result[0], LinkAtom)
@@ -195,7 +191,7 @@ class TestReferenceSemanticParser:
         )
         parser, _ = make_teacher(output)
 
-        atoms = parser.parse("The cat is sleeping on the chair.")
+        atoms = read_atoms(parser, "The cat is sleeping on the chair.")
 
         assert [str(atom) for atom in atoms] == [
             "(StateOf cat sleeping)",
@@ -216,7 +212,7 @@ class TestReferenceSemanticParser:
         )
         parser, _ = make_teacher(output)
 
-        atom = parser.parse("Apple did not acquire Tesla.")[0]
+        atom = read_atoms(parser, "Apple did not acquire Tesla.")[0]
 
         assert str(atom) == "(Not (Evaluation acquire (List Apple Tesla)))"
 
@@ -224,7 +220,7 @@ class TestReferenceSemanticParser:
         output = f"```json\n{structured_output(assertion())}\n```"
         parser, _ = make_teacher(output)
 
-        assert str(parser.parse("A dog has fur.")[0]) == "(Has dog fur)"
+        assert str(read_atoms(parser, "A dog has fur.")[0]) == "(Has dog fur)"
 
     @pytest.mark.parametrize(
         "output",
@@ -238,8 +234,8 @@ class TestReferenceSemanticParser:
     def test_rejects_invalid_structured_output(self, output: str) -> None:
         parser, _ = make_teacher(output)
 
-        with pytest.raises(SemanticParseError, match="invalid structured"):
-            parser.parse("A dog has fur.")
+        with pytest.raises(SemanticParseError, match="Invalid structured"):
+            read_atoms(parser, "A dog has fur.")
 
     def test_rejects_unknown_predicate(self) -> None:
         parser, _ = make_teacher(
@@ -247,7 +243,7 @@ class TestReferenceSemanticParser:
         )
 
         with pytest.raises(SemanticParseError, match="Unknown semantic predicate"):
-            parser.parse("A dog has fur.")
+            read_atoms(parser, "A dog has fur.")
 
     def test_rejects_wrong_argument_roles(self) -> None:
         parser, _ = make_teacher(
@@ -255,31 +251,7 @@ class TestReferenceSemanticParser:
         )
 
         with pytest.raises(SemanticParseError, match="requires argument roles"):
-            parser.parse("A dog has fur.")
-
-    def test_rejects_empty_sentence_without_calling_backend(self) -> None:
-        parser, backend = make_teacher()
-
-        with pytest.raises(ValueError, match="sentence cannot be empty"):
-            parser.parse("   ")
-
-        assert backend.calls == []
-
-    def test_rejects_empty_model_response(self) -> None:
-        parser, _ = make_teacher("   ")
-
-        with pytest.raises(ModelGenerationError, match="empty response"):
-            parser.parse("A dog has fur.")
-
-    def test_wraps_backend_failure(self) -> None:
-        backend = FakeBackend(error=RuntimeError("network failed"))
-        parser = ReferenceSemanticParser(
-            backend=backend,
-            config=SemanticParserConfig(model_name="teacher-model"),
-        )
-
-        with pytest.raises(ModelGenerationError, match="reference parser"):
-            parser.parse("A dog has fur.")
+            read_atoms(parser, "A dog has fur.")
 
     def test_preserves_core_event_with_during_modifier(self) -> None:
         output = structured_output(
@@ -300,7 +272,9 @@ class TestReferenceSemanticParser:
         )
         parser, _ = make_teacher(output)
 
-        atoms = parser.parse("The researcher collected the data during the experiment.")
+        atoms = read_atoms(
+            parser, "The researcher collected the data during the experiment."
+        )
 
         assert [str(atom) for atom in atoms] == [
             "(Evaluation collect (List researcher data))",
@@ -326,7 +300,7 @@ class TestReferenceSemanticParser:
         )
         parser, _ = make_teacher(output)
 
-        atoms = parser.parse("The engineer designed the bridge in 2025.")
+        atoms = read_atoms(parser, "The engineer designed the bridge in 2025.")
 
         assert [str(atom) for atom in atoms] == [
             "(Evaluation design (List engineer bridge))",
@@ -352,7 +326,7 @@ class TestReferenceSemanticParser:
         )
         parser, _ = make_teacher(output)
 
-        atoms = parser.parse("The doctor examined the patient at the hospital.")
+        atoms = read_atoms(parser, "The doctor examined the patient at the hospital.")
 
         assert [str(atom) for atom in atoms] == [
             "(Evaluation examine (List doctor patient))",
@@ -388,9 +362,9 @@ class TestReferenceSemanticParser:
         entity_parser, _ = make_teacher(entity_output)
         event_parser, _ = make_teacher(event_output)
 
-        entity_atoms = entity_parser.parse("The doctor is in the hospital.")
-        event_atoms = event_parser.parse(
-            "The doctor examined the patient at the hospital."
+        entity_atoms = read_atoms(entity_parser, "The doctor is in the hospital.")
+        event_atoms = read_atoms(
+            event_parser, "The doctor examined the patient at the hospital."
         )
 
         assert [str(atom) for atom in entity_atoms] == ["(LocatedIn doctor hospital)"]
@@ -434,7 +408,7 @@ class TestReferenceSemanticParser:
             SemanticParseError,
             match="requires argument roles",
         ):
-            parser.parse("Supporting sentence.")
+            read_atoms(parser, "Supporting sentence.")
 
     def test_accepts_exact_source_span(self) -> None:
         result = SemanticParseResult.model_validate(
@@ -563,7 +537,8 @@ def student(monkeypatch, tmp_path):
     tokenizer.eos_token_id = 1
     encoding = {"input_ids": torch.tensor([[2, 3]]), "attention_mask": torch.ones(1, 2)}
     tokenizer.return_value.to.return_value = encoding
-    tokenizer.decode.return_value = structured_output(assertion())
+    tokenizer.decode.return_value = json.dumps(target("Mira left."))
+    write_checkpoint_metadata(tmp_path)
     model = MagicMock()
     model.device = "cpu"
     model.generate.return_value = torch.tensor([[2, 3, 4]])
@@ -582,27 +557,40 @@ def student(monkeypatch, tmp_path):
 
 
 class TestDistilledSemanticParser:
-    def test_uses_shared_pipeline_and_student_prompt(self, student):
+    def test_uses_the_same_document_prompt_and_target(self, student):
         from parser.student.student_prompt import build_student_prompt
 
         parser, tokenizer, model = student
-        tokenizer.decode.return_value = (
-            "```json\n" + structured_output(assertion()) + "\n```"
-        )
-        assert str(parser.parse(" A dog has fur. ")[0]) == "(Has dog fur)"
+        document = parser.parse("Mira left.")
+        assert document.contract_version == "semantic-document-v1"
         tokenizer.assert_called_once_with(
-            build_student_prompt("A dog has fur."),
+            build_student_prompt("Mira left."),
             return_tensors="pt",
             add_special_tokens=False,
         )
         assert model.generate.call_args.kwargs["max_new_tokens"] == 42
         assert model.generate.call_args.kwargs["num_beams"] == 2
 
+    def test_historical_checkpoint_is_rejected_before_loading_weights(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "training_metadata.json").write_text(
+            json.dumps({"target_contract_version": "legacy-semantic-v1"}),
+            encoding="utf-8",
+        )
+        loader = MagicMock()
+        monkeypatch.setattr(
+            "parser.semantic.semantic_parser.AutoTokenizer.from_pretrained", loader
+        )
+        with pytest.raises(ValueError, match="wrong target contract"):
+            DistilledSemanticParser.from_pretrained(str(tmp_path))
+        loader.assert_not_called()
+
     def test_reports_distilled_role_on_failure(self, student):
         parser, _, model = student
         model.generate.side_effect = RuntimeError("local inference failed")
         with pytest.raises(ModelGenerationError, match="distilled parser"):
-            parser.parse("A dog has fur.")
+            parser.parse("Mira left.")
 
     def test_rejects_empty_input_before_generation(self, student):
         parser, _, model = student
@@ -610,10 +598,39 @@ class TestDistilledSemanticParser:
             parser.parse("  ")
         model.generate.assert_not_called()
 
-    def test_applies_aliases(self, student):
-        parser, _, _ = student
-        atoms = parser.parse("A dog has fur.", aliases={"dog": "Rex"})
-        assert str(atoms[0]) == "(Has Rex fur)"
+
+class TestCanonicalParser:
+    def test_parse_returns_document_and_compatibility_view_is_derived(self):
+        parser, backend = make_teacher(json.dumps(target("Mira left.")))
+        document = parser.parse("Mira left.")
+        assert document.assertions[0].predicate == "Event"
+        assert len(backend.calls) == 1
+        from parser.semantic.compatibility import document_to_legacy_result
+
+        view = document_to_legacy_result(document)
+        assert view.assertions[0].relation == "event"
+        assert len(backend.calls) == 1
+
+    def test_generate_structured_uses_only_the_document_generation(self):
+        parser, backend = make_teacher(json.dumps(target("Mira left.")))
+        result = parser.generate_structured("Mira left.")
+        assert result.assertions[0].relation == "event"
+        assert len(backend.calls) == 1
+        assert "<worked_example>" in backend.calls[0]["prompt"]
+
+    def test_rejects_empty_source_before_backend(self):
+        parser, backend = make_teacher()
+        with pytest.raises(ValueError, match="empty"):
+            parser.parse("  ")
+        assert backend.calls == []
+
+    def test_reports_backend_failure(self):
+        backend = FakeBackend(error=RuntimeError("network failed"))
+        parser = ReferenceSemanticParser(
+            backend=backend, config=SemanticParserConfig(model_name="teacher")
+        )
+        with pytest.raises(ModelGenerationError):
+            parser.parse("Mira left.")
 
 
 @pytest.mark.parametrize(
@@ -660,6 +677,7 @@ def test_distilled_precision_respects_requested_device(
     monkeypatch.setattr(
         "parser.semantic.semantic_parser.AutoModelForCausalLM.from_pretrained", loader
     )
+    write_checkpoint_metadata(tmp_path)
     DistilledSemanticParser.from_pretrained(str(tmp_path), device=device)
     assert loader.call_args.kwargs["torch_dtype"] == expected
     assert loader.call_args.kwargs["device_map"] == device
@@ -694,14 +712,14 @@ def test_preserves_single_conditional_rule() -> None:
 
     parser, _ = make_teacher(output)
 
-    result = parser.generate_structured("If someone is red then they are nice.")
+    result = read_record(parser, "If someone is red then they are nice.")
 
     assert result.assertions == []
     assert len(result.rules) == 1
     assert len(result.rules[0].antecedents) == 1
     assert len(result.rules[0].consequents) == 1
 
-    atoms = parser.parse("If someone is red then they are nice.")
+    atoms = read_atoms(parser, "If someone is red then they are nice.")
 
     assert [str(atom) for atom in atoms] == [
         ("(Implies " "(PropertyOf someone red) " "(PropertyOf someone nice))")
@@ -746,8 +764,8 @@ def test_preserves_multiple_rule_antecedents() -> None:
 
     parser, _ = make_teacher(output)
 
-    result = parser.generate_structured(
-        "If Harry is big and Harry is rough then Harry is nice."
+    result = read_record(
+        parser, "If Harry is big and Harry is rough then Harry is nice."
     )
 
     rule = result.rules[0]
@@ -799,7 +817,7 @@ def test_repairs_conditional_rule_duplicated_as_assertions() -> None:
 
     parser, _ = make_teacher(output)
 
-    result = parser.generate_structured("If Harry is big then Harry is nice.")
+    result = read_record(parser, "If Harry is big then Harry is nice.")
 
     assert result.assertions == []
 
@@ -807,7 +825,7 @@ def test_repairs_conditional_rule_duplicated_as_assertions() -> None:
     assert len(result.rules[0].antecedents) == 1
     assert len(result.rules[0].consequents) == 1
 
-    atoms = parser.parse("If Harry is big then Harry is nice.")
+    atoms = read_atoms(parser, "If Harry is big then Harry is nice.")
 
     assert [str(atom) for atom in atoms] == [
         ("(Implies " "(PropertyOf Harry big) " "(PropertyOf Harry nice))")
@@ -847,7 +865,7 @@ def test_rejects_unsupported_source_span_inside_rule() -> None:
         SemanticParseError,
         match="source_span is not supported by the input text",
     ):
-        parser.generate_structured("If Harry is big then Harry is nice.")
+        read_record(parser, "If Harry is big then Harry is nice.")
 
 
 def test_rejects_unsupported_rule_source_span() -> None:
@@ -883,7 +901,7 @@ def test_rejects_unsupported_rule_source_span() -> None:
         SemanticParseError,
         match="rule source_span is not supported by the input text",
     ):
-        parser.generate_structured("If Harry is big then Harry is nice.")
+        read_record(parser, "If Harry is big then Harry is nice.")
 
 
 def test_preserves_universal_property_rule() -> None:
@@ -922,12 +940,12 @@ def test_preserves_universal_property_rule() -> None:
 
     parser, _ = make_teacher(output)
 
-    result = parser.generate_structured("All big people are red.")
+    result = read_record(parser, "All big people are red.")
 
     assert result.assertions == []
     assert len(result.rules) == 1
 
-    atoms = parser.parse("All big people are red.")
+    atoms = read_atoms(parser, "All big people are red.")
 
     assert [str(atom) for atom in atoms] == [
         "(Implies (PropertyOf $x big) (PropertyOf $x red))"
@@ -980,7 +998,7 @@ def test_preserves_multi_property_universal_rule() -> None:
 
     parser, _ = make_teacher(output)
 
-    atoms = parser.parse("All round, smart things are furry.")
+    atoms = read_atoms(parser, "All round, smart things are furry.")
 
     assert [str(atom) for atom in atoms] == [
         (
@@ -1123,7 +1141,7 @@ def test_rule_repair_preserves_independent_asserted_fact() -> None:
 
     parser, _ = make_teacher(output)
 
-    result = parser.generate_structured("Harry is blue. Smart people are rough.")
+    result = read_record(parser, "Harry is blue. Smart people are rough.")
 
     assert len(result.assertions) == 1
     assert result.assertions[0].arguments[0].value == "Harry"
@@ -1179,9 +1197,10 @@ def test_resolves_rule_pronoun_to_unique_generic_participant() -> None:
 
     parser, _ = make_teacher(output)
 
-    atoms = parser.parse(
+    atoms = read_atoms(
+        parser,
         "If someone sees the rabbit and the rabbit needs "
-        "the bear then they do not need the bear."
+        "the bear then they do not need the bear.",
     )
 
     assert [str(atom) for atom in atoms] == [
@@ -1235,4 +1254,4 @@ def test_rejects_ambiguous_pronoun_inside_rule() -> None:
         SemanticParseError,
         match="Unresolved pronoun inside conditional rule",
     ):
-        parser.generate_structured("If someone sees something then they leave.")
+        read_record(parser, "If someone sees something then they leave.")

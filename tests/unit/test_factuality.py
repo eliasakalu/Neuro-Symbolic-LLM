@@ -9,9 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from parser.semantic import (
-    CallableBackend,
     ReferenceSemanticParser,
-    SemanticParserConfig,
 )
 from parser.semantic.schema import SemanticParseResult
 
@@ -64,30 +62,11 @@ def structured_output(
     )
 
 
-def make_teacher(
-    output: str,
-) -> ReferenceSemanticParser:
-    """Build a deterministic fake teacher parser."""
+def historical_reader(output):
+    """Use the production saved-record reader; never generate this old target."""
+    from functools import partial
 
-    def generate(
-        *,
-        prompt: str,
-        model: str,
-    ) -> str:
-        del prompt
-        del model
-        return output
-
-    return ReferenceSemanticParser(
-        backend=CallableBackend(
-            generate,
-            provider_name="fake-teacher",
-        ),
-        config=SemanticParserConfig(
-            model_name="teacher-model",
-            prompt_version="2.0.0",
-        ),
-    )
+    return partial(ReferenceSemanticParser.read_legacy_result, output)
 
 
 def test_factuality_defaults_to_asserted() -> None:
@@ -186,7 +165,7 @@ def test_rejects_unsupported_factuality_values(
 def test_reference_parser_preserves_factuality(
     factuality: str,
 ) -> None:
-    parser = make_teacher(
+    parser = historical_reader(
         structured_output(
             assertion(
                 factuality=factuality,
@@ -194,13 +173,13 @@ def test_reference_parser_preserves_factuality(
         )
     )
 
-    result = parser.generate_structured("Supporting sentence.")
+    result = parser(sentence="Supporting sentence.")
 
     assert result.assertions[0].factuality == factuality
 
 
 def test_opinion_remains_opinion() -> None:
-    parser = make_teacher(
+    parser = historical_reader(
         structured_output(
             assertion(
                 predicate="Evaluation",
@@ -214,7 +193,7 @@ def test_opinion_remains_opinion() -> None:
         )
     )
 
-    result = parser.generate_structured("I think Paris is beautiful.")
+    result = parser(sentence="I think Paris is beautiful.")
 
     assertion_result = result.assertions[0]
 
@@ -223,7 +202,7 @@ def test_opinion_remains_opinion() -> None:
 
 
 def test_speculative_statement_remains_speculative() -> None:
-    parser = make_teacher(
+    parser = historical_reader(
         structured_output(
             assertion(
                 predicate="Evaluation",
@@ -237,13 +216,13 @@ def test_speculative_statement_remains_speculative() -> None:
         )
     )
 
-    result = parser.generate_structured("The drug probably works.")
+    result = parser(sentence="The drug probably works.")
 
     assert result.assertions[0].factuality == "speculative"
 
 
 def test_speculative_temporal_modifier_inherits_factuality() -> None:
-    parser = make_teacher(
+    parser = historical_reader(
         structured_output(
             assertion(
                 predicate="Evaluation",
@@ -266,7 +245,7 @@ def test_speculative_temporal_modifier_inherits_factuality() -> None:
         )
     )
 
-    result = parser.generate_structured("Paris might become larger next year.")
+    result = parser(sentence="Paris might become larger next year.")
 
     assert [item.factuality for item in result.assertions] == [
         "speculative",
@@ -275,7 +254,7 @@ def test_speculative_temporal_modifier_inherits_factuality() -> None:
 
 
 def test_hypothetical_assertions_remain_hypothetical() -> None:
-    parser = make_teacher(
+    parser = historical_reader(
         structured_output(
             assertion(
                 predicate="Evaluation",
@@ -298,7 +277,7 @@ def test_hypothetical_assertions_remain_hypothetical() -> None:
         )
     )
 
-    result = parser.generate_structured("If it rains, the road may become slippery.")
+    result = parser(sentence="If it rains, the road may become slippery.")
 
     assert len(result.assertions) == 2
 
@@ -306,7 +285,7 @@ def test_hypothetical_assertions_remain_hypothetical() -> None:
 
 
 def test_factuality_is_independent_of_confidence() -> None:
-    parser = make_teacher(
+    parser = historical_reader(
         structured_output(
             assertion(
                 predicate="Evaluation",
@@ -321,7 +300,7 @@ def test_factuality_is_independent_of_confidence() -> None:
         )
     )
 
-    result = parser.generate_structured("The drug probably works.")
+    result = parser(sentence="The drug probably works.")
 
     assertion_result = result.assertions[0]
 
@@ -330,7 +309,7 @@ def test_factuality_is_independent_of_confidence() -> None:
 
 
 def test_factuality_is_independent_of_polarity() -> None:
-    parser = make_teacher(
+    parser = historical_reader(
         structured_output(
             assertion(
                 predicate="Evaluation",
@@ -345,7 +324,7 @@ def test_factuality_is_independent_of_polarity() -> None:
         )
     )
 
-    result = parser.generate_structured("The drug might not work.")
+    result = parser(sentence="The drug might not work.")
 
     assertion_result = result.assertions[0]
 

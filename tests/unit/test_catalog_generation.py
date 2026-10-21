@@ -5,8 +5,12 @@ import json
 import pytest
 
 from parser.ontology.catalog import load_ontology_catalog
-from parser.semantic.catalog_generation import _generate_catalog_payload
-from parser.semantic.semantic_parser import ModelGenerationError, SemanticParseError
+from parser.semantic.catalog_prompt import build_catalog_document_prompt
+from parser.semantic.semantic_parser import (
+    ReferenceSemanticParser,
+    SemanticParseError,
+    SemanticParserConfig,
+)
 
 
 class RecordingBackend:
@@ -21,19 +25,31 @@ class RecordingBackend:
         return self.response
 
 
+def test_all_generation_uses_the_document_prompt() -> None:
+    prompt = ReferenceSemanticParser.build_prompt("Alice opened the door.")
+    assert SemanticParserConfig(model_name="teacher-model").prompt_version == "2.0.0"
+    assert "<worked_example>" in prompt
+    assert "Shared source interpretation rules:" in prompt
+
+
 def test_uses_existing_backend_and_retains_prompt_version() -> None:
     backend = RecordingBackend('```json\n{"entities": [], "assertions": []}\n```')
     source = "  Mira left.  "
 
-    output = _generate_catalog_payload(
-        source,
+    parser = ReferenceSemanticParser(
         catalog=load_ontology_catalog(),
         backend=backend,
-        model_name="teacher-model",
+        config=SemanticParserConfig(model_name="teacher-model"),
     )
+    payload, prompt_version = parser.generate_document_target(source)
 
-    assert output.prompt_version == "catalog-document-v1"
-    assert output.payload == {"entities": [], "assertions": []}
+    assert (
+        prompt_version
+        == build_catalog_document_prompt(
+            source, catalog=load_ontology_catalog()
+        ).version
+    )
+    assert payload == {"entities": [], "assertions": []}
     assert backend.calls[0][1] == "teacher-model"
     assert f"<source_text>\n{source}\n</source_text>" in backend.calls[0][0]
 
@@ -47,24 +63,22 @@ def test_uses_existing_backend_and_retains_prompt_version() -> None:
     ],
 )
 def test_rejects_wrong_envelope_and_model_supplied_metadata(response: str) -> None:
-    with pytest.raises(SemanticParseError, match="Catalog output|must be lists"):
-        _generate_catalog_payload(
-            "Mira left.",
+    with pytest.raises(SemanticParseError, match="Document output|must be lists"):
+        ReferenceSemanticParser(
             catalog=load_ontology_catalog(),
             backend=RecordingBackend(response),
-            model_name="teacher-model",
-        )
+            config=SemanticParserConfig(model_name="teacher-model"),
+        ).generate_document_target("Mira left.")
 
 
 def test_rejects_invalid_or_empty_model_output() -> None:
     for response, error_type in (
         ("not JSON", SemanticParseError),
-        ("  ", ModelGenerationError),
+        ("  ", SemanticParseError),
     ):
         with pytest.raises(error_type):
-            _generate_catalog_payload(
-                "Mira left.",
+            ReferenceSemanticParser(
                 catalog=load_ontology_catalog(),
                 backend=RecordingBackend(response),
-                model_name="teacher-model",
-            )
+                config=SemanticParserConfig(model_name="teacher-model"),
+            ).generate_document_target("Mira left.")
