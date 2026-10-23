@@ -8,12 +8,13 @@ data:
   contract_version: semantic-document-v1
   ontology_bundle_manifest: parser/ontology/bundles/semantic-extraction-v1.yaml
   val_split: 0.1
-  max_length: 16384
+  # Measure complete prompt + label lengths; an integer sets a strict ceiling.
+  max_length: auto
 
 training:
   epochs: 3
-  batch_size: 1
-  gradient_accumulation_steps: 16
+  batch_size: 4
+  gradient_accumulation_steps: 4
   learning_rate: 0.00002
   lr_scheduler: cosine
   bf16: true

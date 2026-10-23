@@ -133,7 +133,7 @@ def evaluate(
     test_sentences: list[str] | None = None,
     max_tokens: int = 3072,
 ) -> None:
-    """Run the actual student through document validation; do not claim accuracy."""
+    """Generate and validate predictions for explicitly supplied sources."""
     from parser.semantic.semantic_parser import DistilledSemanticParser
 
     if not test_sentences:
@@ -180,6 +180,8 @@ def train(
     base_model = config["student"]["base_model"]
     val_split = config["data"]["val_split"]
     max_length = config["data"]["max_length"]
+    if max_length == "auto":
+        max_length = None
     train_cfg = config["training"]
     lora_cfg = config.get("lora", {})
 
@@ -251,6 +253,16 @@ def train(
     train_dataset = StudentDataset(train_pairs, tokenizer, max_length, catalog=catalog)
     val_dataset = StudentDataset(val_pairs, tokenizer, max_length, catalog=catalog)
     print(f"  Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+    required_length = max(
+        getattr(dataset, "required_max_length", 0)
+        for dataset in (train_dataset, val_dataset)
+    )
+    context_limit = getattr(tokenizer, "model_max_length", None)
+    if isinstance(context_limit, int) and required_length > context_limit:
+        raise ValueError(
+            f"Document pairs need {required_length} tokens; tokenizer context limit is {context_limit}"
+        )
+    print(f"  Longest complete prompt and label: {required_length} tokens")
 
     if not train_dataset:
         raise ValueError(

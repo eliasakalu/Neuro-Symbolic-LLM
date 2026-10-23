@@ -60,6 +60,15 @@ def test_oversized_target_is_rejected_instead_of_truncated():
         StudentDataset([pair], tokenizer, max_length=length - 1)
 
 
+def test_automatic_length_measures_complete_examples():
+    records = [canonical_pair("Mira left."), canonical_pair("Mira left much earlier.")]
+    dataset = StudentDataset(records, CharacterTokenizer())
+    assert len(dataset) == 2
+    assert dataset.required_max_length == max(
+        len(dataset[index]["input_ids"]) for index in range(len(dataset))
+    )
+
+
 @pytest.mark.parametrize("invalid", [None, [], 42, {"input": "Dog", "label": "{}"}])
 def test_malformed_or_historical_record_is_rejected(invalid):
     with pytest.raises(ValueError):
