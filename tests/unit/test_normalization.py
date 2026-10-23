@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from parser.semantic.normalization import (
@@ -14,7 +16,7 @@ from parser.semantic.schema import SemanticParseResult
 
 
 def test_document_normalization_preserves_identity_evidence_and_meaning() -> None:
-    payload = {
+    payload: dict[str, Any] = {
         "entities": [
             {"id": "e-1", "type": " Event ", "mention": "left", "occurrence": 0}
         ],
