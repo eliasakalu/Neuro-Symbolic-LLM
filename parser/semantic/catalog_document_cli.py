@@ -59,11 +59,17 @@ def run_export(arguments: argparse.Namespace) -> int:
             parser,
             input_path=arguments.input,
             output_path=arguments.output,
-            rejected_path=arguments.rejected_output,
+            rejected_path=arguments.rejected_output
+            or arguments.output.with_name(f"{arguments.output.stem}.rejected.jsonl"),
             student_pairs_path=arguments.student_pairs_output,
             bundle_path=arguments.bundle_output,
             ontology_bundle=bundle,
             corpus_id=arguments.corpus_id,
+            metadata_output=getattr(arguments, "metadata_output", None),
+            include_metta=getattr(arguments, "include_metta", False),
+            asserted_only=getattr(arguments, "asserted_only", False),
+            resume=getattr(arguments, "resume", False),
+            progress_every=getattr(arguments, "progress_every", 100),
         )
     except (ModelGenerationError, OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
@@ -74,6 +80,7 @@ def run_export(arguments: argparse.Namespace) -> int:
         print(f"Student pairs: {result.accepted} -> {result.student_pairs_path}")
     if result.bundle_path is not None:
         print(f"Ontology bundle: {result.bundle_path}")
+    print(f"Source metadata: {result.metadata_path}")
     return 2 if result.rejected else 0
 
 

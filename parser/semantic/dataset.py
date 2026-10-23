@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import math
 import random
+import warnings
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +22,12 @@ from parser.semantic.catalog_student import (
     make_student_pair,
     validate_catalog_student_pair,
 )
+from parser.semantic.document_metadata import (
+    document_metadata,
+    load_document_metadata,
+    metadata_path,
+    source_metadata,
+)
 from parser.semantic.semantic_parser import (
     ModelGenerationError,
     ReferenceSemanticParser,
@@ -30,6 +38,27 @@ if TYPE_CHECKING:
     from parser.ontology.catalog import OntologyCatalog
 
 # ── Dataset records ────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class DistillationRecord:
+    """A canonical teacher document with producer metadata and optional rendering."""
+
+    text: str
+    target: dict[str, Any]
+    teacher_provider: str
+    teacher_model: str
+    prompt_version: str
+    semantic_contract_version: str
+    source_dataset: str | None = None
+    source_domain: str | None = None
+    metta: tuple[str, ...] | None = None
+    rendering_error: str | None = None
+    metta_asserted_only: bool = False
+
+    @property
+    def document(self) -> SemanticDocument:
+        return SemanticDocument.model_validate(self.target)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,10 +84,8 @@ class SemanticDatasetBuilder:
     ) -> None:
         """Store the parser and dataset-generation policy."""
         self._parser = parser
-        if include_metta or asserted_only:
-            raise ValueError(
-                "Canonical datasets preserve factuality and rules; render or filter downstream"
-            )
+        self._include_metta = include_metta or asserted_only
+        self._asserted_only = asserted_only
 
     def generate(
         self,
@@ -66,7 +93,7 @@ class SemanticDatasetBuilder:
         *,
         source_dataset: str | None = None,
         source_domain: str | None = None,
-    ) -> tuple[list[SemanticDocument], list[RejectedRecord]]:
+    ) -> tuple[list[DistillationRecord], list[RejectedRecord]]:
         """Parse sentences and separate accepted from rejected examples."""
         accepted = []
         rejected = []
@@ -88,10 +115,44 @@ class SemanticDatasetBuilder:
                     document = SemanticDocument.model_validate(
                         {
                             **document.model_dump(mode="json"),
-                            "corpus_id": source_dataset,
+                            "corpus_id": (
+                                source_dataset
+                                if not any(
+                                    character.isspace() for character in source_dataset
+                                )
+                                else "source-"
+                                + sha256(source_dataset.encode("utf-8")).hexdigest()
+                            ),
                         }
                     )
-                accepted.append(document)
+                metta = None
+                rendering_error = None
+                if self._include_metta:
+                    from parser.semantic.compatibility import render_document_view
+
+                    try:
+                        metta = tuple(
+                            render_document_view(
+                                document, asserted_only=self._asserted_only
+                            )
+                        )
+                    except ValueError as error:
+                        rendering_error = str(error)
+                accepted.append(
+                    DistillationRecord(
+                        text=sentence,
+                        target=document.model_dump(mode="json"),
+                        teacher_provider=self._parser.provider_name,
+                        teacher_model=self._parser.model_name,
+                        prompt_version=document.parser.prompt_version,
+                        semantic_contract_version=document.contract_version,
+                        source_dataset=source_dataset,
+                        source_domain=source_domain,
+                        metta=metta,
+                        rendering_error=rendering_error,
+                        metta_asserted_only=self._asserted_only,
+                    )
+                )
             except (ModelGenerationError, SemanticParseError, ValueError) as error:
                 rejected.append(RejectedRecord(text=sentence, error=str(error)))
 
@@ -99,16 +160,44 @@ class SemanticDatasetBuilder:
 
     @staticmethod
     def write_jsonl(
-        records: Iterable[SemanticDocument],
+        records: Iterable[DistillationRecord | SemanticDocument],
         output_path: str | Path,
     ) -> None:
         """Write accepted records as UTF-8 JSON Lines."""
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        with path.open("w", encoding="utf-8") as file:
+        sidecar = metadata_path(path)
+        with (
+            path.open("w", encoding="utf-8") as file,
+            sidecar.open("w", encoding="utf-8") as metadata_file,
+        ):
             for record in records:
-                file.write(record.canonical_json() + "\n")
+                document = (
+                    record.document
+                    if isinstance(record, DistillationRecord)
+                    else record
+                )
+                file.write(document.canonical_json() + "\n")
+                fields = {}
+                if isinstance(record, DistillationRecord):
+                    fields = {
+                        name: value
+                        for name in (
+                            "source_dataset",
+                            "source_domain",
+                            "metta",
+                            "rendering_error",
+                            "metta_asserted_only",
+                        )
+                        if (value := getattr(record, name)) is not None
+                    }
+                metadata_file.write(
+                    json.dumps(
+                        document_metadata(document, **fields), ensure_ascii=False
+                    )
+                    + "\n"
+                )
 
     @staticmethod
     def write_rejected_jsonl(
@@ -141,16 +230,17 @@ class StudentDataset(Dataset):
         self,
         pairs: list[dict],
         tokenizer,
-        max_length: int = 16384,
+        max_length: int | None = None,
         *,
         catalog: OntologyCatalog | None = None,
     ):
-        if max_length <= 0:
+        if max_length is not None and (isinstance(max_length, bool) or max_length <= 0):
             raise ValueError("max_length must be positive")
         if tokenizer.eos_token_id is None:
             raise ValueError("Student training requires an EOS token")
         self.examples = []
         self.oversized = 0
+        self.required_max_length = 0
         active_catalog = catalog if catalog is not None else load_ontology_catalog()
 
         for pair_index, pair in enumerate(pairs, start=1):
@@ -163,7 +253,8 @@ class StudentDataset(Dataset):
             target_ids = tokenizer(json_label, add_special_tokens=False)["input_ids"]
             target_ids = target_ids + [tokenizer.eos_token_id]
             input_ids = prompt_ids + target_ids
-            if len(input_ids) > max_length:
+            self.required_max_length = max(self.required_max_length, len(input_ids))
+            if max_length is not None and len(input_ids) > max_length:
                 raise ValueError(
                     f"Catalog pair {pair_index} needs {len(input_ids)} tokens; "
                     f"max_length is {max_length}. Targets are never truncated."
@@ -214,8 +305,15 @@ def structured_to_pairs(
     include_confidence: bool = False,
     *,
     catalog: OntologyCatalog | None = None,
+    metadata_file: str | Path | None = None,
 ) -> list[dict]:
-    """Recover the same training target from documents; reject historical labels."""
+    """Convert canonical documents into validated student pairs."""
+    if max_per_text != 1:
+        warnings.warn(
+            "max_per_text is deprecated; full document labels are retained",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     source, destination = Path(input_file), Path(output_file)
     if source.resolve() == destination.resolve() or (
         destination.exists() and source.samefile(destination)
@@ -224,6 +322,12 @@ def structured_to_pairs(
     if destination.exists():
         raise ValueError(f"Refusing to overwrite existing output: {destination}")
     active_catalog = catalog if catalog is not None else load_ontology_catalog()
+    sidecar = (
+        Path(metadata_file) if metadata_file is not None else metadata_path(source)
+    )
+    if metadata_file is not None and not sidecar.is_file():
+        raise FileNotFoundError(f"Metadata sidecar not found: {sidecar}")
+    metadata = load_document_metadata(sidecar) if sidecar.exists() else None
     pairs = []
     with source.open(encoding="utf-8") as file:
         for line_number, line in enumerate(file, 1):
@@ -231,7 +335,26 @@ def structured_to_pairs(
                 continue
             try:
                 document = SemanticDocument.model_validate_json(line)
-                pair = make_student_pair(document)
+                fields = {}
+                if metadata is not None:
+                    identity = document.corpus_id, document.document_id
+                    if identity not in metadata:
+                        raise ValueError(
+                            "Document is missing from the metadata sidecar"
+                        )
+                    fields = source_metadata(document, metadata.pop(identity))
+                pair = make_student_pair(
+                    document,
+                    source_dataset=fields.get("source_dataset"),
+                    source_domain=fields.get("source_domain"),
+                    reference_context=fields.get("reference_context"),
+                )
+                if include_confidence:
+                    pair["confidence"] = (
+                        document.assertions[0].confidence
+                        if document.assertions
+                        else 1.0
+                    )
                 _, _, reconstructed = validate_catalog_student_pair(
                     pair, catalog=active_catalog
                 )
@@ -242,6 +365,8 @@ def structured_to_pairs(
                 raise ValueError(
                     f"Invalid document at {source}:{line_number}: {error}"
                 ) from error
+    if metadata:
+        raise ValueError("Metadata sidecar contains unmatched documents")
     write_pairs_jsonl(pairs, destination)
     return pairs
 

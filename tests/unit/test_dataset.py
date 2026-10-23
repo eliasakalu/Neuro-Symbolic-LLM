@@ -35,8 +35,8 @@ def test_builder_preserves_exact_source_and_outputs_only_documents(tmp_path):
     builder = SemanticDatasetBuilder(make_parser())
     accepted, rejected = builder.generate(["  Mira left.  ", "  "])
     assert len(accepted) == len(rejected) == 1
-    assert accepted[0].source_text == "  Mira left.  "
-    assert accepted[0].contract_version == "semantic-document-v1"
+    assert accepted[0].document.source_text == "  Mira left.  "
+    assert accepted[0].document.contract_version == "semantic-document-v1"
     path = tmp_path / "nested" / "documents.jsonl"
     builder.write_jsonl(accepted, path)
     record = json.loads(path.read_text(encoding="utf-8"))
@@ -58,13 +58,34 @@ def test_builder_retains_each_factuality_without_asserted_only_filter(factuality
         ["Mira left."]
     )
     assert not rejected
-    assert documents[0].assertions[0].factuality == factuality
+    assert documents[0].document.assertions[0].factuality == factuality
 
 
 @pytest.mark.parametrize("option", ["include_metta", "asserted_only"])
-def test_lossy_dataset_options_are_rejected(option):
-    with pytest.raises(ValueError, match="preserve factuality"):
-        SemanticDatasetBuilder(make_parser(), **{option: True})
+def test_dataset_options_only_affect_derived_views(option):
+    records, rejected = SemanticDatasetBuilder(
+        make_parser(), **{option: True}
+    ).generate(["Mira left."])
+    assert not rejected
+    assert records[0].document.assertions[0].factuality == "asserted"
+    assert records[0].metta
+
+
+def test_builder_preserves_metadata_through_later_pair_conversion(tmp_path):
+    builder = SemanticDatasetBuilder(make_parser())
+    records, rejected = builder.generate(
+        ["Mira left."], source_dataset="pilot", source_domain="narrative"
+    )
+    assert not rejected
+    assert records[0].source_domain == "narrative"
+    source = tmp_path / "documents.jsonl"
+    builder.write_jsonl(records, source)
+    pairs = structured_to_pairs(
+        str(source), str(tmp_path / "pairs.jsonl"), include_confidence=True
+    )
+    assert pairs[0]["source_dataset"] == "pilot"
+    assert pairs[0]["source_domain"] == "narrative"
+    assert pairs[0]["confidence"] == records[0].document.assertions[0].confidence
 
 
 def test_invalid_model_output_is_quarantined():

@@ -8,8 +8,9 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from parser.semantic.document_metadata import document_metadata, metadata_path
 from parser.semantic.semantic_parser import ReferenceSemanticParser
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ class ExportResult:
     rejected_path: Path
     student_pairs_path: Path | None = None
     bundle_path: Path | None = None
+    metadata_path: Path | None = None
 
 
 def _source_fields(raw_line: str) -> tuple[str, str, str]:
@@ -77,7 +79,8 @@ def source_record(
                 if not isinstance(item, str) or not item.strip():
                     raise ValueError(f"{field} must be nonempty text or null")
                 metadata[field] = item
-        namespace = metadata.get("source_dataset", corpus_id)
+        dataset = metadata.get("source_dataset", corpus_id)
+        namespace = dataset if _IDENTIFIER.fullmatch(dataset) else corpus_id
     else:
         text, metadata, namespace = raw_line, {}, corpus_id
     if not isinstance(text, str) or not text.strip():
@@ -100,136 +103,302 @@ def export_catalog_documents(
     bundle_path: str | Path | None = None,
     ontology_bundle: OntologyBundle | None = None,
     corpus_id: str | None = None,
+    metadata_output: str | Path | None = None,
+    include_metta: bool = False,
+    asserted_only: bool = False,
+    resume: bool = False,
+    progress_every: int = 100,
 ) -> ExportResult:
-    """Export validated documents and optional labels from one model call each."""
+    """Stream documents and retain fingerprinted checkpoints on interruption."""
+    import sys
 
-    source = Path(input_path)
-    accepted = Path(output_path)
-    rejected = Path(rejected_path)
-    pairs = Path(student_pairs_path) if student_pairs_path is not None else None
-    bundle_output = Path(bundle_path) if bundle_path is not None else None
-    if bundle_output is not None and ontology_bundle is None:
-        raise ValueError("Bundle output requires the loaded ontology bundle")
-    outputs: tuple[Path, ...] = (accepted, rejected)
-    if pairs is not None:
-        outputs += (pairs,)
-    if bundle_output is not None:
-        outputs += (bundle_output,)
-    paths = (source, *outputs)
-    if len({path.resolve() for path in paths}) != len(paths):
-        raise ValueError(
-            "Input, accepted-output, rejected-output, student-pairs, and bundle paths must all differ"
-        )
-    if not source.is_file():
-        raise FileNotFoundError(f"Source JSONL file not found: {source}")
-    for path in outputs:
-        if path.exists():
-            raise FileExistsError(f"Output already exists: {path}")
-
-    accepted.parent.mkdir(parents=True, exist_ok=True)
-    rejected.parent.mkdir(parents=True, exist_ok=True)
-    if pairs is not None:
-        pairs.parent.mkdir(parents=True, exist_ok=True)
-    if bundle_output is not None:
-        bundle_output.parent.mkdir(parents=True, exist_ok=True)
-    accepted_count = 0
-    rejected_count = 0
-    seen_documents: set[tuple[str, str]] = set()
-    created_paths: list[Path] = []
-    try:
-        with ExitStack() as files:
-            source_file = files.enter_context(source.open("r", encoding="utf-8"))
-            accepted_file = files.enter_context(
-                accepted.open("x", encoding="utf-8", newline="\n")
-            )
-            created_paths.append(accepted)
-            rejected_file = files.enter_context(
-                rejected.open("x", encoding="utf-8", newline="\n")
-            )
-            created_paths.append(rejected)
-            pairs_file = None
-            if bundle_output is not None:
-                bundle_file = files.enter_context(
-                    bundle_output.open("x", encoding="utf-8", newline="\n")
-                )
-                created_paths.append(bundle_output)
-                assert ontology_bundle is not None
-                bundle_file.write(ontology_bundle.canonical_json() + "\n")
-            if pairs is not None:
-                pairs_file = files.enter_context(
-                    pairs.open("x", encoding="utf-8", newline="\n")
-                )
-                created_paths.append(pairs)
-            for line_number, line in enumerate(source_file, start=1):
-                raw_line = line.removesuffix("\n").removesuffix("\r")
-                try:
-                    document_id, record_corpus, source_text, source_metadata = (
-                        source_record(
-                            raw_line,
-                            jsonl=source.suffix.lower() == ".jsonl",
-                            corpus_id=(
-                                corpus_id if corpus_id is not None else source.stem
-                            ),
-                        )
-                    )
-                    identity = (record_corpus, document_id)
-                    if identity in seen_documents:
-                        raise ValueError(f"Duplicate source document {identity!r}")
-                    seen_documents.add(identity)
-                    if pairs_file is None:
-                        document = parser.parse_document(
-                            document_id=document_id,
-                            corpus_id=record_corpus,
-                            source_text=source_text,
-                        )
-                    else:
-                        document, target = parser.parse_document_with_target(
-                            document_id=document_id,
-                            corpus_id=record_corpus,
-                            source_text=source_text,
-                        )
-                except ValueError as error:
-                    rejected_file.write(
-                        json.dumps(
-                            {
-                                "line_number": line_number,
-                                "raw_line": raw_line,
-                                "error": str(error),
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
-                    rejected_count += 1
-                    continue
-                accepted_file.write(document.canonical_json() + "\n")
-                if pairs_file is not None:
-                    from parser.semantic.catalog_student import make_student_pair
-
-                    pairs_file.write(
-                        json.dumps(
-                            make_student_pair(
-                                document, target=target, **source_metadata
-                            ),
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
-                accepted_count += 1
-    except BaseException:
-        # Only remove paths created by this invocation. An interrupted run must
-        # not leave partial files that appear to be completed exports.
-        for path in created_paths:
-            path.unlink(missing_ok=True)
-        raise
-
-    return ExportResult(
-        accepted=accepted_count,
-        rejected=rejected_count,
-        output_path=accepted,
-        rejected_path=rejected,
-        student_pairs_path=pairs,
-        bundle_path=bundle_output,
+    if progress_every < 1:
+        raise ValueError("progress_every must be positive")
+    source, accepted, rejected = (
+        Path(input_path),
+        Path(output_path),
+        Path(rejected_path),
     )
+    outputs = {
+        "documents": accepted,
+        "rejected": rejected,
+        "metadata": (
+            Path(metadata_output)
+            if metadata_output is not None
+            else metadata_path(accepted)
+        ),
+    }
+    if student_pairs_path is not None:
+        outputs["pairs"] = Path(student_pairs_path)
+    if bundle_path is not None:
+        if ontology_bundle is None:
+            raise ValueError("Bundle output requires the loaded ontology bundle")
+        outputs["bundle"] = Path(bundle_path)
+    checkpoint = accepted.with_name(accepted.name + ".checkpoint.json")
+    partials = {
+        name: path.with_name(path.name + ".partial") for name, path in outputs.items()
+    }
+    paths = [
+        source,
+        checkpoint,
+        checkpoint.with_name(checkpoint.name + ".tmp"),
+        *outputs.values(),
+        *partials.values(),
+    ]
+    if len({path.resolve() for path in paths}) != len(paths):
+        raise ValueError("Input and output paths must all differ")
+    if not source.is_file():
+        raise FileNotFoundError(f"Source file not found: {source}")
+    identity = {
+        "source_sha256": _file_digest(source),
+        "source_path": str(source.resolve()),
+        "outputs": {name: str(path.resolve()) for name, path in outputs.items()},
+        "model": parser.model_name,
+        "provider": parser.provider_name,
+        "prompt_version": parser.prompt_version,
+        "model_revision": getattr(parser, "_model_revision", None),
+        "generation_settings": {
+            name: getattr(parser._backend, name, None)
+            for name in (
+                "_max_output_tokens",
+                "_max_new_tokens",
+                "_think",
+                "_temperature",
+                "_seed",
+            )
+        },
+        "bundle": (
+            ontology_bundle.canonical_json() if ontology_bundle is not None else None
+        ),
+        "corpus_id": corpus_id,
+        "include_metta": include_metta,
+        "asserted_only": asserted_only,
+    }
+    state: dict[str, Any] = {
+        "identity": identity,
+        "line_number": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "complete": False,
+        "files": {},
+    }
+    if resume:
+        state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or state.get("identity") != identity:
+            raise ValueError(
+                "Export checkpoint does not match source, outputs, model, or prompt"
+            )
+        if set(state.get("files", {})) != set(outputs):
+            raise ValueError("Export checkpoint has an invalid artifact set")
+        if any(
+            not isinstance(state.get(name), int)
+            or isinstance(state[name], bool)
+            or state[name] < 0
+            for name in ("line_number", "accepted", "rejected")
+        ) or not isinstance(state.get("complete"), bool):
+            raise ValueError("Export checkpoint has invalid counters")
+        for name, partial in partials.items():
+            path = partial if partial.exists() else outputs[name]
+            if path.is_symlink() or path.samefile(source):
+                raise ValueError(
+                    "Resume artifacts must not alias the source or use symlinks"
+                )
+            if not partial.exists() and not state["complete"]:
+                raise ValueError(f"Missing partial export: {partial}")
+            record = state["files"][name]
+            if (
+                not isinstance(record, dict)
+                or not isinstance(record.get("size"), int)
+                or isinstance(record["size"], bool)
+                or record["size"] < 0
+                or not isinstance(record.get("sha256"), str)
+            ):
+                raise ValueError("Export checkpoint has invalid artifact fingerprints")
+            if state["complete"] and path.stat().st_size != record["size"]:
+                raise ValueError(f"Completed export artifact differs: {path}")
+            if (
+                path.stat().st_size < record["size"]
+                or _file_digest(path, record["size"]) != record["sha256"]
+            ):
+                raise ValueError(f"Export checkpoint artifact differs: {path}")
+            if outputs[name].exists() and partial.exists():
+                raise FileExistsError(f"Output already exists: {outputs[name]}")
+    else:
+        for path in [checkpoint, *outputs.values(), *partials.values()]:
+            if path.exists():
+                raise FileExistsError(
+                    f"Output already exists: {path}; use --resume for an interrupted export"
+                )
+    for path in outputs.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if not state["complete"]:
+        seen: set[tuple[str, str]] = set()
+        try:
+            with ExitStack() as files:
+                handles, hashes = {}, {}
+                for name, partial in partials.items():
+                    handle = files.enter_context(
+                        partial.open("r+b" if resume else "x+b")
+                    )
+                    offset = state["files"][name]["size"] if resume else 0
+                    handle.truncate(offset)
+                    handle.seek(0)
+                    digest = sha256()
+                    while chunk := handle.read(1024 * 1024):
+                        digest.update(chunk)
+                    handles[name], hashes[name] = handle, digest
+
+                def write(name: str, payload: str) -> None:
+                    content = (payload + "\n").encode("utf-8")
+                    handles[name].write(content)
+                    hashes[name].update(content)
+
+                def mark() -> None:
+                    state["files"] = {
+                        name: {
+                            "size": handle.tell(),
+                            "sha256": hashes[name].hexdigest(),
+                        }
+                        for name, handle in handles.items()
+                    }
+
+                def persist() -> None:
+                    for handle in handles.values():
+                        handle.flush()
+                    _write_checkpoint(checkpoint, state)
+
+                if not resume:
+                    if ontology_bundle is not None and "bundle" in handles:
+                        write("bundle", ontology_bundle.canonical_json())
+                    mark()
+                    persist()
+                with source.open(encoding="utf-8") as source_file:
+                    for number, line in enumerate(source_file, 1):
+                        raw = line.removesuffix("\n").removesuffix("\r")
+                        if number <= state["line_number"]:
+                            try:
+                                doc_id, corpus, _, _ = source_record(
+                                    raw,
+                                    jsonl=source.suffix.lower() == ".jsonl",
+                                    corpus_id=corpus_id or source.stem,
+                                )
+                                seen.add((corpus, doc_id))
+                            except ValueError:
+                                pass
+                            continue
+                        try:
+                            doc_id, corpus, text, annotations = source_record(
+                                raw,
+                                jsonl=source.suffix.lower() == ".jsonl",
+                                corpus_id=corpus_id or source.stem,
+                            )
+                            key = corpus, doc_id
+                            if key in seen:
+                                raise ValueError(f"Duplicate source document {key!r}")
+                            seen.add(key)
+                            if "pairs" in handles:
+                                document, target = parser.parse_document_with_target(
+                                    document_id=doc_id,
+                                    corpus_id=corpus,
+                                    source_text=text,
+                                )
+                            else:
+                                document = parser.parse_document(
+                                    document_id=doc_id,
+                                    corpus_id=corpus,
+                                    source_text=text,
+                                )
+                        except ValueError as error:
+                            write(
+                                "rejected",
+                                json.dumps(
+                                    {
+                                        "line_number": number,
+                                        "raw_line": raw,
+                                        "error": str(error),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            )
+                            state["rejected"] += 1
+                        else:
+                            metadata = document_metadata(document, **annotations)
+                            if include_metta or asserted_only:
+                                from parser.semantic.compatibility import (
+                                    render_document_view,
+                                )
+
+                                try:
+                                    metadata["metta"] = render_document_view(
+                                        document, asserted_only=asserted_only
+                                    )
+                                    metadata["metta_asserted_only"] = asserted_only
+                                except ValueError as error:
+                                    metadata["rendering_error"] = str(error)
+                            payloads = {
+                                "documents": document.canonical_json(),
+                                "metadata": json.dumps(metadata, ensure_ascii=False),
+                            }
+                            if "pairs" in handles:
+                                from parser.semantic.catalog_student import (
+                                    make_student_pair,
+                                )
+
+                                payloads["pairs"] = json.dumps(
+                                    make_student_pair(
+                                        document, target=target, **annotations
+                                    ),
+                                    ensure_ascii=False,
+                                )
+                            for name, payload in payloads.items():
+                                write(name, payload)
+                            state["accepted"] += 1
+                        state["line_number"] = number
+                        mark()
+                        if number % progress_every == 0:
+                            persist()
+                            print(
+                                f"Processed {number} records | accepted={state['accepted']} rejected={state['rejected']}",
+                                file=sys.stderr,
+                            )
+                state["complete"] = True
+                persist()
+        except BaseException:
+            if state["files"]:
+                _write_checkpoint(checkpoint, state)
+            raise
+    for name, partial in partials.items():
+        if partial.exists():
+            if outputs[name].exists():
+                raise FileExistsError(f"Output already exists: {outputs[name]}")
+            partial.rename(outputs[name])
+    checkpoint.unlink()
+    return ExportResult(
+        state["accepted"],
+        state["rejected"],
+        accepted,
+        rejected,
+        outputs.get("pairs"),
+        outputs.get("bundle"),
+        outputs["metadata"],
+    )
+
+
+def _file_digest(path: Path, limit: int | None = None) -> str:
+    digest = sha256()
+    with path.open("rb") as file:
+        remaining = path.stat().st_size if limit is None else limit
+        while remaining:
+            chunk = file.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError(f"Incomplete artifact: {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def _write_checkpoint(path: Path, state: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        json.dump(state, file, ensure_ascii=False)
+    temporary.replace(path)

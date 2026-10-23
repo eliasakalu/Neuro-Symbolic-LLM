@@ -162,6 +162,8 @@ def test_backend_failure_stops_export_without_partial_output(tmp_path: Path) -> 
 
     assert not output_path.exists()
     assert not rejected_path.exists()
+    assert output_path.with_name(output_path.name + ".partial").exists()
+    assert output_path.with_name(output_path.name + ".checkpoint.json").exists()
     assert input_path.read_text(encoding="utf-8").count("\n") == 2
 
 
@@ -322,14 +324,22 @@ def test_build_dataset_document_target_matches_export_and_student_validation(
     assert json.loads(label)["assertions"][0]["predicate"] == "Event"
 
 
-def test_document_dataset_rejects_lossy_filter_before_generation(
+def test_document_dataset_keeps_complete_documents_with_a_filtered_view(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    def unexpected(profile):
-        pytest.fail("Backend must not be constructed for incompatible options")
+    from tests.semantic_fixtures import target
 
-    monkeypatch.setattr(model_config, "create_backend", unexpected)
-    with pytest.raises(SystemExit) as error:
+    payload = target("Mira left.")
+    payload["assertions"][0]["factuality"] = "speculative"
+    monkeypatch.setattr(
+        model_config,
+        "create_backend",
+        lambda _: CallableBackend(lambda **__: json.dumps(payload)),
+    )
+    (tmp_path / "source.jsonl").write_text(
+        _source_line("one", "Mira left.") + "\n", encoding="utf-8"
+    )
+    assert (
         cli.main(
             [
                 "build-dataset",
@@ -342,4 +352,83 @@ def test_document_dataset_rejects_lossy_filter_before_generation(
                 "--asserted-only",
             ]
         )
-    assert error.value.code == 2
+        == 0
+    )
+    document = SemanticDocument.model_validate_json(
+        (tmp_path / "documents.jsonl").read_text(encoding="utf-8")
+    )
+    assert document.assertions[0].factuality == "speculative"
+    metadata = json.loads(
+        (tmp_path / "documents.metadata.jsonl").read_text(encoding="utf-8")
+    )
+    assert metadata["metta"] == []
+    assert metadata["metta_asserted_only"] is True
+
+
+def test_resume_preserves_work_and_does_not_repeat_completed_calls(tmp_path):
+    calls = []
+    available = False
+
+    def generate(*, prompt, model):
+        text = prompt.rsplit("<source_text>\n", 1)[1].split("\n</source_text>", 1)[0]
+        calls.append(text)
+        if text == "Second." and not available:
+            raise ConnectionError("offline")
+        return '{"entities": [], "assertions": []}'
+
+    parser = CatalogSemanticDocumentParser(
+        backend=CallableBackend(generate), model_name="resume-review"
+    )
+    source = tmp_path / "source.txt"
+    source.write_text("First.\nSecond.\n", encoding="utf-8")
+    options = {
+        "input_path": source,
+        "output_path": tmp_path / "documents.jsonl",
+        "rejected_path": tmp_path / "rejected.jsonl",
+        "student_pairs_path": tmp_path / "pairs.jsonl",
+    }
+    with pytest.raises(ModelGenerationError):
+        export_catalog_documents(parser, **options)
+    checkpoint = tmp_path / "documents.jsonl.checkpoint.json"
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["accepted"] == 1
+    assert not options["output_path"].exists()
+    available = True
+    result = export_catalog_documents(parser, **options, resume=True)
+    assert result.accepted == 2
+    assert calls == ["First.", "Second.", "Second."]
+    assert not checkpoint.exists()
+    assert len(options["output_path"].read_text(encoding="utf-8").splitlines()) == 2
+
+
+@pytest.mark.parametrize("changed", ["source", "artifact"])
+def test_resume_rejects_changed_inputs_before_generation(tmp_path, changed):
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        raise ConnectionError("offline")
+
+    parser = CatalogSemanticDocumentParser(
+        backend=CallableBackend(generate), model_name="resume-review"
+    )
+    source = tmp_path / "source.txt"
+    source.write_text("First.\n", encoding="utf-8")
+    options = {
+        "input_path": source,
+        "output_path": tmp_path / "documents.jsonl",
+        "rejected_path": tmp_path / "rejected.jsonl",
+    }
+    with pytest.raises(ModelGenerationError):
+        export_catalog_documents(parser, **options)
+    if changed == "source":
+        source.write_text("Changed.\n", encoding="utf-8")
+    else:
+        partial = tmp_path / "documents.jsonl.partial"
+        partial.write_text("corrupt", encoding="utf-8")
+        state_path = tmp_path / "documents.jsonl.checkpoint.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["files"]["documents"]["size"] = 7
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="checkpoint"):
+        export_catalog_documents(parser, **options, resume=True)
+    assert len(calls) == 1

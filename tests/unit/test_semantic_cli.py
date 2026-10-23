@@ -143,6 +143,71 @@ def test_help_supports_windows_encoding():
     assert cli.build_argument_parser().format_help().encode("cp1252")
 
 
+def test_export_defaults_rejections_and_retains_derived_metadata(tmp_path, backend):
+    source, output = tmp_path / "input.txt", tmp_path / "documents.jsonl"
+    source.write_text("Mira left.\n", encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "build-dataset",
+                "--input",
+                str(source),
+                "--output",
+                str(output),
+                "--include-metta",
+            ]
+        )
+        == 0
+    )
+    assert (tmp_path / "documents.rejected.jsonl").read_text(encoding="utf-8") == ""
+    metadata = json.loads(
+        (tmp_path / "documents.metadata.jsonl").read_text(encoding="utf-8")
+    )
+    assert metadata["metta"]
+    assert "metta" not in json.loads(output.read_text(encoding="utf-8"))
+
+
+def test_e2e_uses_accepted_pairs_and_normalized_expected_labels(
+    tmp_path, monkeypatch, backend, capsys
+):
+    from parser.semantic.catalog_student import validate_catalog_student_pair
+    from parser.student import train as training
+
+    calls = []
+
+    def train(**kwargs):
+        calls.append(kwargs)
+        return kwargs["output_dir"]
+
+    monkeypatch.setattr(training, "train", train)
+    inferred = []
+
+    class Student:
+        def parse(self, text, context=""):
+            inferred.append(text)
+            return validate_catalog_student_pair(
+                pair(text),
+                catalog=cli.command_catalog(
+                    cli.build_argument_parser().parse_args(["parse", text])
+                ),
+            )[2]
+
+    monkeypatch.setattr(
+        cli.DistilledSemanticParser, "from_pretrained", lambda *_, **__: Student()
+    )
+    sentences = [f"Source {index}." for index in range(10)]
+    # The exporter quarantines an invalid source without discarding accepted data.
+    sentences.append(" ")
+    root = tmp_path / "run"
+    assert cli.main(["e2e", "--sentences", *sentences, "--output-dir", str(root)]) == 0
+    assert len(calls) == 1
+    assert len(inferred) == 1
+    assert "exact target matches: 1/1" in capsys.readouterr().out
+    assert len((root / "rejected.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    assert cli.main(["e2e", "--output-dir", str(root), "--skip-training"]) == 1
+    # Real checkpoint validation remains mandatory when training is skipped.
+
+
 def test_legacy_target_is_not_an_active_choice():
     with pytest.raises(SystemExit):
         cli.build_argument_parser().parse_args(

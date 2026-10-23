@@ -17,7 +17,7 @@ from parser.semantic.catalog_prompt import build_catalog_document_prompt
 _PAIR_FIELDS = frozenset(
     {"contract_version", "document_id", "corpus_id", "input", "parser", "label"}
 )
-_SOURCE_METADATA = frozenset({"source_dataset", "source_domain"})
+_SOURCE_METADATA = frozenset({"source_dataset", "source_domain", "reference_context"})
 
 
 def document_target(document: SemanticDocument) -> dict[str, Any]:
@@ -71,8 +71,9 @@ def make_student_pair(
     target: dict[str, Any] | None = None,
     source_dataset: str | None = None,
     source_domain: str | None = None,
+    reference_context: str | None = None,
 ) -> dict[str, Any]:
-    """Encode one document as a supervised pair, not a second semantic target."""
+    """Create a supervised source-to-document pair."""
     pair = {
         "contract_version": document.contract_version,
         "document_id": document.document_id,
@@ -89,6 +90,7 @@ def make_student_pair(
     for field, value in (
         ("source_dataset", source_dataset),
         ("source_domain", source_domain),
+        ("reference_context", reference_context),
     ):
         if value is not None:
             pair[field] = value
@@ -107,12 +109,20 @@ def validate_catalog_student_pair(
     if (
         not isinstance(pair, dict)
         or not set(pair) >= _PAIR_FIELDS
-        or set(pair) - _PAIR_FIELDS - _SOURCE_METADATA
+        or set(pair) - _PAIR_FIELDS - _SOURCE_METADATA - {"confidence"}
     ):
         raise ValueError("Catalog student pair has missing or unexpected fields")
     for field in _SOURCE_METADATA & pair.keys():
         if not isinstance(pair[field], str) or not pair[field].strip():
             raise ValueError(f"{field} must be nonempty text")
+    if "confidence" in pair:
+        confidence = pair["confidence"]
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, int | float)
+            or not 0 <= confidence <= 1
+        ):
+            raise ValueError("Pair confidence must be a number in [0, 1]")
     if pair["contract_version"] != "semantic-document-v1":
         raise ValueError("Unsupported catalog student contract version")
     source_text = pair["input"]
@@ -122,7 +132,9 @@ def validate_catalog_student_pair(
         raise ValueError("Catalog student input and label must be strings")
     if not isinstance(provenance, dict):
         raise ValueError("Catalog student parser provenance must be an object")
-    prompt = build_catalog_document_prompt(source_text, catalog=catalog)
+    prompt = build_catalog_document_prompt(
+        source_text, catalog=catalog, context=pair.get("reference_context", "")
+    )
     if provenance.get("prompt_version") != prompt.version:
         raise ValueError(
             "Catalog student prompt version does not match the active prompt"
