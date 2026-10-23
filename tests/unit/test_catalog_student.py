@@ -82,6 +82,33 @@ def test_pair_rejects_stale_prompt_provenance() -> None:
         )
 
 
+def test_default_fields_do_not_change_exact_target_comparison():
+    from parser.semantic.catalog_student import document_target
+
+    catalog = load_ontology_catalog(modules=("upper",))
+    _, _, document = validate_catalog_student_pair(_pair(), catalog=catalog)
+    recovered = {**_pair(), "label": json.dumps(document_target(document))}
+    _, _, restored = validate_catalog_student_pair(recovered, catalog=catalog)
+    assert document_target(restored) == document_target(document)
+
+
+def test_rendering_does_not_silently_drop_factuality():
+    from parser.semantic.compatibility import render_document_view
+
+    pair = _pair()
+    payload = json.loads(pair["label"])
+    payload["assertions"][0]["factuality"] = "speculative"
+    pair["label"] = json.dumps(payload)
+    _, _, document = validate_catalog_student_pair(
+        pair, catalog=load_ontology_catalog(modules=("upper",))
+    )
+    before = document.canonical_json()
+    with pytest.raises(ValueError, match="factuality"):
+        render_document_view(document)
+    assert render_document_view(document, asserted_only=True) == []
+    assert document.canonical_json() == before
+
+
 def test_compatible_label_retains_its_original_parser_provenance() -> None:
     pair = _pair()
     provenance = pair["parser"]

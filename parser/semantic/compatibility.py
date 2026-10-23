@@ -1,4 +1,4 @@
-"""Derived assertion/rule views; never a model target or miner interchange."""
+"""Adapters for historical assertion records and derived MeTTa rendering."""
 
 from __future__ import annotations
 
@@ -90,4 +90,56 @@ def document_to_legacy_result(
             for rule in document.rules
         ],
     )
-    return normalize_semantic_result(result, aliases=aliases, alias_types=alias_types)
+    normalized = normalize_semantic_result(
+        result, aliases=aliases, alias_types=alias_types
+    )
+    original = [*document.assertions]
+    projected = [*normalized.assertions]
+    for rule, view_rule in zip(document.rules, normalized.rules, strict=True):
+        original.extend((*rule.antecedents, *rule.consequents))
+        projected.extend((*view_rule.antecedents, *view_rule.consequents))
+    symbols: dict[str, str] = {}
+    for assertion, view in zip(original, projected, strict=True):
+        for identifier, argument in zip(
+            assertion.arguments, view.arguments, strict=True
+        ):
+            if identifier not in entities:
+                continue
+            if argument.value in symbols and symbols[argument.value] != identifier:
+                raise ValueError(
+                    "Distinct entity IDs would collapse in the lexical rendering; use document JSON"
+                )
+            symbols[argument.value] = identifier
+    return normalized
+
+
+def render_document_view(
+    document: SemanticDocument, *, asserted_only: bool = False
+) -> list[str]:
+    """Render an explicit derived view without modifying canonical documents."""
+    from parser.semantic.semantic_parser import ReferenceSemanticParser
+
+    if asserted_only:
+        document = document.model_copy(
+            update={
+                "assertions": tuple(
+                    a for a in document.assertions if a.factuality == "asserted"
+                ),
+                "rules": (),
+            }
+        )
+    if not document.assertions and not document.rules:
+        return []
+    if any(
+        a.conditional_on is not None
+        or a.factuality != "asserted"
+        or a.predicate == "Negated"
+        for a in document.assertions
+    ):
+        raise ValueError(
+            "Lexical MeTTa rendering cannot preserve this assertion's factuality or negation scope; use document JSON"
+        )
+    view = document_to_legacy_result(document)
+    expressions = ReferenceSemanticParser.render_metta(view)
+    ReferenceSemanticParser.validate_rendered_metta(expressions)
+    return expressions
