@@ -12,7 +12,8 @@ def build_student_prompt(
     sentence: str, context: str = "", *, catalog: OntologyCatalog | None = None
 ) -> str:
     """Use the same extraction guidance, examples and schema as the teacher."""
-    source = f"{context}\n{sentence}" if context else sentence
     return build_catalog_document_prompt(
-        source, catalog=catalog if catalog is not None else load_ontology_catalog()
+        sentence,
+        catalog=catalog if catalog is not None else load_ontology_catalog(),
+        context=context,
     ).text

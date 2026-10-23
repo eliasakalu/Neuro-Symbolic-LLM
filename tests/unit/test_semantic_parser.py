@@ -125,7 +125,8 @@ class TestPrompt:
 
         prompt = ReferenceSemanticParser.build_prompt("Mira left.", context="Earlier.")
         assert prompt == build_student_prompt("Mira left.", context="Earlier.")
-        assert "<source_text>\nEarlier.\nMira left.\n</source_text>" in prompt
+        assert "<source_text>\nMira left.\n</source_text>" in prompt
+        assert "<reference_context>\nEarlier.\n</reference_context>" in prompt
         assert "<worked_example>" in prompt
         assert "Ontology versions:" in prompt
 

@@ -32,6 +32,39 @@ def test_all_generation_uses_the_document_prompt() -> None:
     assert "Shared source interpretation rules:" in prompt
 
 
+def test_instance_prompt_and_generation_use_the_selected_catalog():
+    catalog = load_ontology_catalog(modules=("upper",))
+    backend = RecordingBackend('{"entities": [], "assertions": [], "rules": []}')
+    parser = ReferenceSemanticParser(
+        backend=backend,
+        config=SemanticParserConfig(model_name="review"),
+        catalog=catalog,
+    )
+    inspected = parser.build_document_prompt("Mira left.")
+    parser.parse("Mira left.")
+    assert inspected.text == backend.calls[0][0]
+    assert "Ontology versions: upper-v1\n" in inspected.text
+
+
+def test_reference_context_is_not_added_to_the_extraction_source():
+    from tests.semantic_fixtures import target
+
+    backend = RecordingBackend(json.dumps(target("She left.")))
+    parser = ReferenceSemanticParser(
+        backend=backend, config=SemanticParserConfig(model_name="review")
+    )
+    document = parser.parse("She left.", context="Nora arrived yesterday.")
+    assert document.source_text == "She left."
+    assert (
+        "<reference_context>\nNora arrived yesterday.\n</reference_context>"
+        in backend.calls[0][0]
+    )
+    assert document.assertions[0].source_spans[0].end == len("She left.")
+    backend.response = json.dumps(target("Nora arrived yesterday."))
+    with pytest.raises(SemanticParseError, match="absent from source"):
+        parser.parse("She left.", context="Nora arrived yesterday.")
+
+
 def test_uses_existing_backend_and_retains_prompt_version() -> None:
     backend = RecordingBackend('```json\n{"entities": [], "assertions": []}\n```')
     source = "  Mira left.  "

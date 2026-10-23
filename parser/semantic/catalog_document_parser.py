@@ -19,11 +19,7 @@ CATALOG_PARSER_VERSION = "catalog-semantic-parser-v7"
 
 
 class CatalogSemanticDocumentParser(ReferenceSemanticParser):
-    """Preserve the public constructor; extraction runs in the shared parser.
-
-    New integrations may configure ReferenceSemanticParser directly. This class
-    adds no generation, normalization, or document-parsing implementation.
-    """
+    """Compatibility constructor for the shared document parser."""
 
     def __init__(
         self,

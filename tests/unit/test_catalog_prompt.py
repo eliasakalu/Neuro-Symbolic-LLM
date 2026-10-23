@@ -25,7 +25,7 @@ def test_prompt_uses_catalog_signatures_and_versions() -> None:
         "Although it rained, Mira left.", catalog=load_ontology_catalog()
     )
 
-    assert prompt.version.startswith("catalog-document-v13+sha256.")
+    assert prompt.version.startswith("catalog-document-v14+sha256.")
     assert len(prompt.version.split("+sha256.")[1]) == 64
     assert "discourse-v1" in prompt.text
     assert "upper-v1" in prompt.text
@@ -143,7 +143,7 @@ def test_every_legacy_relation_description_is_reused_but_not_operators() -> None
         if name != "Cause" and not definition.get("fallback"):
             assert f"- {name}({', '.join(definition['roles'])}):" in guidance
     assert "- ArgMin(" not in guidance
-    assert "Legacy Evaluation fallback semantics:" in guidance
+    assert "Evaluation:" in guidance
     assert "variable_arity" not in guidance
 
 

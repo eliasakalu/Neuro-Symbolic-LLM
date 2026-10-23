@@ -11,6 +11,7 @@ Both generate the same document target; rendering is a derived view.
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -222,19 +223,32 @@ class _BaseSemanticParser:
         return build_catalog_document_prompt("prompt identity", catalog=catalog).version
 
     @staticmethod
-    def build_prompt(sentence: str, context: str = "") -> str:
+    def build_prompt(
+        sentence: str, context: str = "", *, catalog: OntologyCatalog | None = None
+    ) -> str:
         """Build the same catalog-constrained prompt used for document labels."""
         if not sentence.strip():
             raise ValueError("The sentence cannot be empty")
-        source_text = context + "\n" + sentence if context else sentence
         return build_catalog_document_prompt(
-            source_text, catalog=load_ontology_catalog()
+            sentence,
+            catalog=catalog if catalog is not None else load_ontology_catalog(),
+            context=context,
         ).text
 
     @staticmethod
     def clean_model_output(output: str) -> str:
         """Unwrap JSON presentation without altering decoded semantic values."""
         return clean_model_output(output)
+
+    def build_document_prompt(self, source_text: str, context: str = ""):
+        """Inspect the prompt for this instance's configured catalog."""
+        return build_catalog_document_prompt(
+            source_text,
+            catalog=(
+                self._catalog if self._catalog is not None else load_ontology_catalog()
+            ),
+            context=context,
+        )
 
     @staticmethod
     def repair_known_predicate_contract(
@@ -678,7 +692,11 @@ class _BaseSemanticParser:
         return self.clean_model_output(output)
 
     def generate_document_target(
-        self, source_text: str, *, catalog: OntologyCatalog | None = None
+        self,
+        source_text: str,
+        *,
+        catalog: OntologyCatalog | None = None,
+        context: str = "",
     ) -> tuple[dict[str, Any], str]:
         """Generate the quote-based document target with this parser's model.
 
@@ -688,7 +706,9 @@ class _BaseSemanticParser:
         active_catalog = catalog if catalog is not None else self._catalog
         if active_catalog is None:
             active_catalog = load_ontology_catalog()
-        prompt = build_catalog_document_prompt(source_text, catalog=active_catalog)
+        prompt = build_catalog_document_prompt(
+            source_text, catalog=active_catalog, context=context
+        )
         from parser.semantic.catalog_output_schema import catalog_output_schema
 
         cleaned = self._generate_response(
@@ -716,22 +736,21 @@ class _BaseSemanticParser:
         return payload, prompt.version
 
     def parse_document(
-        self, *, document_id: str, corpus_id: str, source_text: str
+        self, *, document_id: str, corpus_id: str, source_text: str, context: str = ""
     ) -> SemanticDocument:
-        """Produce the miner-facing target without a second parser invocation."""
+        """Parse an identified source document into the shared contract."""
         document, _ = self.parse_document_with_target(
-            document_id=document_id, corpus_id=corpus_id, source_text=source_text
+            document_id=document_id,
+            corpus_id=corpus_id,
+            source_text=source_text,
+            context=context,
         )
         return document
 
     def parse_document_with_target(
-        self, *, document_id: str, corpus_id: str, source_text: str
+        self, *, document_id: str, corpus_id: str, source_text: str, context: str = ""
     ) -> tuple[SemanticDocument, dict[str, object]]:
-        """Validate one generation and retain its exact student label.
-
-        The shared document library runs locally. Generating a compatibility
-        view also requires that library, but neither operation starts PeTTa.
-        """
+        """Return a validated document and its normalized quote-based label."""
         from parser.semantic.catalog_document_parser import (
             CATALOG_PARSER_VERSION,
             prepare_catalog_target,
@@ -741,7 +760,7 @@ class _BaseSemanticParser:
             self._catalog if self._catalog is not None else load_ontology_catalog()
         )
         payload, prompt_version = self.generate_document_target(
-            source_text, catalog=catalog
+            source_text, catalog=catalog, context=context
         )
         document, payload = prepare_catalog_target(
             payload,
@@ -812,20 +831,20 @@ class _BaseSemanticParser:
         )
 
     def parse(self, sentence: str, context: str = "") -> SemanticDocument:
-        """Extract one document from context plus sentence, for either model.
-
-        Context is part of the exact source and may itself yield assertions;
-        it is not reference-only background for a target-sentence projection.
-        """
+        """Extract the sentence, using optional reference-only background."""
         from hashlib import sha256
 
         if not sentence.strip():
             raise ValueError("The sentence cannot be empty")
-        source_text = context + "\n" + sentence if context else sentence
         return self.parse_document(
-            document_id="text-" + sha256(source_text.encode("utf-8")).hexdigest(),
+            document_id="text-"
+            + sha256(
+                ((context + "\0") if context else "").encode("utf-8")
+                + sentence.encode("utf-8")
+            ).hexdigest(),
             corpus_id="interactive",
-            source_text=source_text,
+            source_text=sentence,
+            context=context,
         )
 
 
@@ -833,7 +852,7 @@ class _BaseSemanticParser:
 
 
 class ReferenceSemanticParser(_BaseSemanticParser):
-    """High-accuracy parser used for offline annotation and dataset generation."""
+    """Reference model parser for offline annotation and dataset generation."""
 
     parser_role = "reference"
 
@@ -869,6 +888,8 @@ class DistilledSemanticParser(_BaseSemanticParser):
         device: str = "auto",
         max_new_tokens: int = 3072,
         num_beams: int = 4,
+        *,
+        catalog: OntologyCatalog | None = None,
     ):
         self.model_dir = Path(model_dir)
         self.max_new_tokens = max_new_tokens
@@ -883,7 +904,7 @@ class DistilledSemanticParser(_BaseSemanticParser):
             raise ValueError("Student training metadata must be a JSON object")
         from parser.semantic.catalog_student import validate_catalog_student_checkpoint
 
-        catalog = load_ontology_catalog()
+        catalog = catalog if catalog is not None else load_ontology_catalog()
         validate_catalog_student_checkpoint(self.model_dir, catalog=catalog)
 
         # Load tokenizer from disk
@@ -908,7 +929,10 @@ class DistilledSemanticParser(_BaseSemanticParser):
                 with torch.cuda.device(index):
                     supports_bf16 = supports_bf16 and torch.cuda.is_bf16_supported()
         if not supports_bf16:
-            print("Using float32 for distilled inference on the requested device")
+            print(
+                "Using float32 for distilled inference on the requested device",
+                file=sys.stderr,
+            )
 
         # Load model from disk
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -933,8 +957,11 @@ class DistilledSemanticParser(_BaseSemanticParser):
             catalog=catalog,
         )
 
-        print(f"DistilledSemanticParser loaded from {model_dir}")
-        print(f"  Base model: {self.metadata.get('base_model', 'unknown')}")
+        print(f"DistilledSemanticParser loaded from {model_dir}", file=sys.stderr)
+        print(
+            f"  Base model: {self.metadata.get('base_model', 'unknown')}",
+            file=sys.stderr,
+        )
 
     @classmethod
     def from_pretrained(
@@ -943,9 +970,11 @@ class DistilledSemanticParser(_BaseSemanticParser):
         device: str = "auto",
         max_new_tokens: int = 3072,
         num_beams: int = 4,
+        *,
+        catalog: OntologyCatalog | None = None,
     ) -> DistilledSemanticParser:
         """Load a saved model for inference."""
-        return cls(model_dir, device, max_new_tokens, num_beams)
+        return cls(model_dir, device, max_new_tokens, num_beams, catalog=catalog)
 
 
 # ── Builder functions ─────────────────────────────────────────────────────────

@@ -237,15 +237,20 @@ def build_distilled_semantic_parser(
     config_path: str | Path | None = None,
     *,
     profile_name: str | None = None,
+    catalog: OntologyCatalog | None = None,
 ) -> DistilledSemanticParser:
     """Build the configured local document-target student."""
     profile = load_model_profile(
         config_path, profile_name=profile_name or "semantic_document_student"
     )
-    if profile.provider != "transformers" or profile.settings.get("role") != "student":
+    if (
+        profile.provider != "transformers-local"
+        or profile.settings.get("role") != "student"
+    ):
         raise ValueError("Distilled parser requires a local student model profile")
     return DistilledSemanticParser.from_pretrained(
         model_dir=profile.model,
         device=str(profile.settings.get("device", "auto")),
-        max_new_tokens=int(profile.settings.get("max_output_tokens", 3072)),
+        max_new_tokens=int(profile.settings.get("max_new_tokens", 3072)),
+        catalog=catalog,
     )

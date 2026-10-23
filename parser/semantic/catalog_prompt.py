@@ -63,7 +63,7 @@ def _catalog_guide(catalog: OntologyCatalog) -> str:
 
 
 def _relation_guidance(catalog: OntologyCatalog) -> str:
-    """Reuse every legacy relation description without expanding the ontology.
+    """Build interpretation guidance from predicate definitions.
 
     Only explicitly reviewed equivalents supplement known catalog predicates.
     Other descriptions guide ProvisionalRelation extraction. Legacy operators
@@ -89,7 +89,7 @@ def _relation_guidance(catalog: OntologyCatalog) -> str:
         if definition.get("fallback"):
             # Reuse the fallback's meaning, not Evaluation's legacy JSON shape
             # or its renderer-specific argument limits.
-            fallback.append(f"- Legacy {name} fallback semantics: {description}")
+            fallback.append(f"- {name}: {description}")
             continue
         roles = definition.get("roles")
         arity = definition.get("arity")
@@ -195,7 +195,7 @@ def _worked_examples(catalog: OntologyCatalog) -> str:
 
 
 def build_catalog_document_prompt(
-    source_text: str, *, catalog: OntologyCatalog
+    source_text: str, *, catalog: OntologyCatalog, context: str = ""
 ) -> CatalogDocumentPrompt:
     """Render catalog guidance without modifying the source or its offsets."""
 
@@ -233,5 +233,13 @@ def build_catalog_document_prompt(
     fingerprint = sha256(guidance.encode("utf-8")).hexdigest()
     return CatalogDocumentPrompt(
         version=f"{version}+sha256.{fingerprint}",
-        text=f"{guidance}\n\n<source_text>\n{source_text}\n</source_text>",
+        text=(
+            f"{guidance}\n\n"
+            + (
+                f"<reference_context>\n{context}\n</reference_context>\n"
+                if context
+                else ""
+            )
+            + f"<source_text>\n{source_text}\n</source_text>"
+        ),
     )
