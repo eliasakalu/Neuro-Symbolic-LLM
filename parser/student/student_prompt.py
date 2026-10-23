@@ -1,35 +1,19 @@
-"""Shared prompt contract for student training and inference."""
+"""One prompt builder for document-target student training and inference."""
 
-STUDENT_PROMPT = """Convert the sentence into the structured semantic JSON contract.
+from __future__ import annotations
 
-Return JSON only.
+from parser.ontology.catalog import OntologyCatalog, load_ontology_catalog
+from parser.semantic.catalog_prompt import build_catalog_document_prompt
 
-The output must have exactly these top-level fields:
-- "assertions": a list of standalone semantic assertions
-- "rules": a list of conditional semantic rules
-
-Use the supported semantic predicates and canonical argument roles.
-
-Important:
-- Use PropertyOf for adjectival properties such as "X is red".
-- Use Evaluation for actions and relations such as "X sees Y".
-- Use rules for conditional or universal implications.
-- Preserve negation with polarity="negative".
-- Preserve factuality.
-- Use canonical relation lemmas such as "see", not "sees".
-- Do not invent extra assertions.
-- Do not return generic triples, dependency parses, tokens, or explanations.
-
-Sentence: {text}
-
-JSON:"""
+STUDENT_PROMPT = "catalog-document"
 
 
-def build_student_prompt(sentence: str, context: str = "") -> str:
-    """Build the shared student training/inference prompt."""
-    prompt = STUDENT_PROMPT.format(text=sentence.strip())
-
-    if context.strip():
-        return f"Context: {context.strip()}\n{prompt}"
-
-    return prompt
+def build_student_prompt(
+    sentence: str, context: str = "", *, catalog: OntologyCatalog | None = None
+) -> str:
+    """Use the same extraction guidance, examples and schema as the teacher."""
+    return build_catalog_document_prompt(
+        sentence,
+        catalog=catalog if catalog is not None else load_ontology_catalog(),
+        context=context,
+    ).text

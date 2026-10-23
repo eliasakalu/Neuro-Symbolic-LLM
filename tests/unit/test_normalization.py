@@ -2,14 +2,67 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from parser.semantic.normalization import (
     SemanticNormalizationError,
+    normalize_document_target,
     normalize_semantic_result,
     normalize_symbol,
 )
 from parser.semantic.schema import SemanticParseResult
+
+
+def test_document_normalization_preserves_identity_evidence_and_meaning() -> None:
+    payload: dict[str, Any] = {
+        "entities": [
+            {"id": "e-1", "type": " Event ", "mention": "left", "occurrence": 0}
+        ],
+        "assertions": [
+            {
+                "predicate": " Event ",
+                "arguments": ["e-1"],
+                "argument_types": [" Event "],
+                "factuality": " hypothetical ",
+                "status": " extracted-hypothesis ",
+                "source_quotes": [{"text": "  left", "occurrence": 0}],
+                "alternatives": ["another interpretation"],
+            }
+        ],
+    }
+    normalized = normalize_document_target(payload)
+    assertion = normalized["assertions"][0]
+    assert normalized["entities"][0]["type"] == "Event"
+    assert assertion["predicate"] == "Event"
+    assert assertion["argument_types"] == ["Event"]
+    assert assertion["factuality"] == "hypothetical"
+    assert assertion["conditional_on"] is None
+    assert assertion["arguments"] == ["e-1"]
+    assert assertion["source_quotes"] == payload["assertions"][0]["source_quotes"]
+    assert payload["entities"][0]["type"] == " Event "
+    assert normalize_document_target(normalized) == normalized
+
+
+def test_document_normalization_does_not_guess_missing_semantics() -> None:
+    payload = {
+        "entities": [],
+        "assertions": [
+            {
+                "predicate": "Unknown",
+                "arguments": [" ambiguous id "],
+                "argument_types": ["UnknownType"],
+                "conditional_on": "",
+            }
+        ],
+    }
+    normalized = normalize_document_target(payload)
+    assertion = normalized["assertions"][0]
+    assert assertion["predicate"] == "Unknown"
+    assert assertion["arguments"] == [" ambiguous id "]
+    assert assertion["conditional_on"] == ""
+    assert "factuality" not in assertion
 
 
 def make_result(

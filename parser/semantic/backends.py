@@ -213,6 +213,9 @@ class OllamaBackend:
         client: Any | None = None,
         *,
         max_output_tokens: int = 256,
+        think: bool | None = None,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> None:
         """Create the backend, optionally injecting a client for tests."""
         if max_output_tokens <= 0:
@@ -228,14 +231,37 @@ class OllamaBackend:
             client = Client()
         self._client = client
         self._max_output_tokens = max_output_tokens
+        self._think = think
+        self._temperature = temperature
+        if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+            raise ValueError("Ollama seed must be an integer")
+        self._seed = seed
 
     def generate(self, *, prompt: str, model: str) -> str:
         """Generate text using an Ollama model."""
+        return self._generate(prompt=prompt, model=model)
+
+    def generate_json(self, *, prompt: str, model: str, schema: dict[str, Any]) -> str:
+        """Ask Ollama to constrain decoding to the supplied JSON schema."""
+        return self._generate(prompt=prompt, model=model, schema=schema)
+
+    def _generate(
+        self, *, prompt: str, model: str, schema: dict[str, Any] | None = None
+    ) -> str:
+        options: dict[str, int | float] = {"num_predict": self._max_output_tokens}
+        if self._temperature is not None:
+            options["temperature"] = self._temperature
+        if self._seed is not None:
+            options["seed"] = self._seed
+        thinking = {"think": self._think} if self._think is not None else {}
+        formatting = {"format": schema} if schema is not None else {}
         response = self._client.generate(
             model=model,
             prompt=prompt,
             stream=False,
-            options={"num_predict": self._max_output_tokens},
+            options=options,
+            **thinking,
+            **formatting,
         )
         output = (
             response.get("response")
@@ -260,6 +286,7 @@ class TransformersBackend:
         tokenizer: Any,
         model: Any,
         max_new_tokens: int = 256,
+        add_special_tokens: bool = True,
     ) -> None:
         """Store a loaded tokenizer and model."""
         if max_new_tokens <= 0:
@@ -267,12 +294,15 @@ class TransformersBackend:
         self._tokenizer = tokenizer
         self._model = model
         self._max_new_tokens = max_new_tokens
+        self._add_special_tokens = add_special_tokens
 
     def generate(self, *, prompt: str, model: str) -> str:
         """Generate deterministic output using the loaded local model."""
         del model
 
-        inputs = self._tokenizer(prompt, return_tensors="pt")
+        inputs = self._tokenizer(
+            prompt, return_tensors="pt", add_special_tokens=self._add_special_tokens
+        )
         if hasattr(inputs, "to") and hasattr(self._model, "device"):
             inputs = inputs.to(self._model.device)
 

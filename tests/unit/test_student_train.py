@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from parser.student import train as training
+from tests.semantic_fixtures import pair as canonical_pair
+from tests.semantic_fixtures import write_checkpoint_metadata
 
 
 class TinyModel(torch.nn.Module):
@@ -27,7 +29,12 @@ class TinyModel(torch.nn.Module):
 def run_training(monkeypatch, tmp_path):
     config = {
         "student": {"base_model": "tiny", "output_dir": str(tmp_path)},
-        "data": {"val_split": 0, "max_length": 32},
+        "data": {
+            "val_split": 0,
+            "max_length": 32,
+            "contract_version": "semantic-document-v1",
+            "ontology_bundle_manifest": "parser/ontology/bundles/semantic-extraction-v1.yaml",
+        },
         "training": {
             "batch_size": 1,
             "epochs": 2,
@@ -47,8 +54,8 @@ def run_training(monkeypatch, tmp_path):
         for i in range(5)
     ]
     monkeypatch.setattr(training, "load_config", lambda _: config)
-    monkeypatch.setattr(training, "load_pairs", lambda _: examples)
-    monkeypatch.setattr(training, "StudentDataset", lambda pairs, *_: pairs)
+    monkeypatch.setattr(training, "load_pairs", lambda _, **kwargs: examples)
+    monkeypatch.setattr(training, "StudentDataset", lambda pairs, *_, **kwargs: pairs)
     monkeypatch.setattr(training, "save_model", lambda *args: None)
     monkeypatch.setattr(
         training.AutoTokenizer,
@@ -150,7 +157,12 @@ def capture_training_splits(monkeypatch, tmp_path):
 
     config = {
         "student": {"base_model": "tiny", "output_dir": str(tmp_path / "model")},
-        "data": {"val_split": 0.2, "max_length": 32},
+        "data": {
+            "val_split": 0.2,
+            "max_length": 32,
+            "contract_version": "semantic-document-v1",
+            "ontology_bundle_manifest": "parser/ontology/bundles/semantic-extraction-v1.yaml",
+        },
         "training": {"seed": 42},
     }
     monkeypatch.setattr(training, "load_config", lambda _: config)
@@ -168,7 +180,7 @@ def capture_training_splits(monkeypatch, tmp_path):
         config["data"]["val_split"] = val_ratio
         captured = []
 
-        def dataset(records, *_):
+        def dataset(records, *_, **kwargs):
             captured.append(records)
             if len(captured) == 2:
                 raise SplitsCapturedError
@@ -193,8 +205,8 @@ def capture_training_splits(monkeypatch, tmp_path):
 
 
 def test_fallback_split_removes_duplicate_inputs(capture_training_splits):
-    pairs = [{"input": f"Sentence {i}", "label": "{}"} for i in range(10)]
-    pairs.append({"input": "  Sentence 0  ", "label": "{}"})
+    pairs = [canonical_pair(f"Sentence {i}") for i in range(10)]
+    pairs.append(canonical_pair("  Sentence 0  "))
     train_pairs, val_pairs = capture_training_splits(pairs)
     train_texts = {pair["input"].strip() for pair in train_pairs}
     val_texts = {pair["input"].strip() for pair in val_pairs}
@@ -206,28 +218,28 @@ def test_fallback_split_removes_duplicate_inputs(capture_training_splits):
 
 
 def test_fallback_split_uses_reproducible_seed(capture_training_splits):
-    pairs = [{"input": f"Sentence {i}", "label": "{}"} for i in range(20)]
+    pairs = [canonical_pair(f"Sentence {i}") for i in range(20)]
     first = capture_training_splits(pairs, seed=42)
     assert first == capture_training_splits(pairs, seed=42)
     assert first != capture_training_splits(pairs, seed=7)
 
 
 def test_fallback_zero_validation_keeps_all_unique_inputs(capture_training_splits):
-    pairs = [{"input": "Dog", "label": "{}"}] * 2
+    pairs = [canonical_pair("Dog")] * 2
     train_pairs, val_pairs = capture_training_splits(pairs, val_ratio=0)
     assert train_pairs == pairs[:1]
     assert val_pairs == []
 
 
 def test_explicit_validation_is_preserved(capture_training_splits):
-    pairs = [{"input": "Dog", "label": "{}"}]
-    validation = [{"input": "Cat", "label": "{}"}]
+    pairs = [canonical_pair("Dog")]
+    validation = [canonical_pair("Cat")]
     assert capture_training_splits(pairs, validation=validation) == [pairs, validation]
 
 
 def test_explicit_validation_still_rejects_overlap(capture_training_splits):
-    pairs = [{"input": "Dog", "label": "{}"}]
-    validation = [{"input": " Dog ", "label": "{}"}]
+    pairs = [canonical_pair("Dog")]
+    validation = [canonical_pair(" Dog ")]
     with pytest.raises(ValueError, match="Train and validation sets overlap"):
         capture_training_splits(pairs, validation=validation)
 
@@ -235,7 +247,7 @@ def test_explicit_validation_still_rejects_overlap(capture_training_splits):
 @pytest.mark.parametrize("ratio", [-0.1, 1.1, float("nan"), float("inf")])
 def test_fallback_rejects_invalid_ratios(capture_training_splits, ratio):
     with pytest.raises(ValueError, match="Split ratios"):
-        capture_training_splits([{"input": "Dog", "label": "{}"}], val_ratio=ratio)
+        capture_training_splits([canonical_pair("Dog")], val_ratio=ratio)
 
 
 @pytest.mark.parametrize(
@@ -247,9 +259,14 @@ def test_fallback_rejects_invalid_ratios(capture_training_splits, ratio):
     ],
 )
 def test_evaluation_selects_safe_checkpoint_precision(
-    monkeypatch, cuda_available, bf16_supported, expected
+    monkeypatch, tmp_path, cuda_available, bf16_supported, expected
 ):
+    write_checkpoint_metadata(tmp_path)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1 if cuda_available else 0)
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: bf16_supported)
     monkeypatch.setattr(
         training.AutoTokenizer,
@@ -267,7 +284,7 @@ def test_evaluation_selects_safe_checkpoint_precision(
 
     monkeypatch.setattr(training.AutoModelForCausalLM, "from_pretrained", load_model)
     with pytest.raises(ModelLoadCapturedError):
-        training.evaluate("saved-model", test_sentences=["Dogs are animals."])
+        training.evaluate(str(tmp_path), test_sentences=["Dogs are animals."])
     assert loaded["torch_dtype"] == expected
 
 
@@ -288,3 +305,21 @@ def test_load_pairs_reports_bad_records(tmp_path, content):
     path.write_text("\n" + content, encoding="utf-8")
     with pytest.raises(ValueError, match=r"pairs.jsonl:2"):
         training.load_pairs(str(path))
+
+
+def test_load_pairs_preserves_utf8_with_a_non_utf8_system_default(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "pairs.jsonl"
+    import json
+
+    example = canonical_pair("José left. 🙂")
+    path.write_text(json.dumps(example, ensure_ascii=False) + "\n", encoding="utf-8")
+    original_open = open
+
+    def system_default_open(file, mode="r", *, encoding=None):
+        return original_open(file, mode, encoding=encoding or "cp1252")
+
+    monkeypatch.setattr(training, "open", system_default_open, raising=False)
+
+    assert training.load_pairs(str(path)) == [example]

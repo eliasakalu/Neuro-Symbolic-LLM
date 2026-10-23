@@ -5,18 +5,17 @@ Structured natural-language semantic parsers.
 ReferenceSemanticParser uses a large model (teacher) for offline annotation.
 DistilledSemanticParser uses a saved fine-tuned model (student) for inference.
 
-Both share the same validation, normalization, and rendering pipeline.
+Both generate the same document target; rendering is a derived view.
 """
 
 from __future__ import annotations
 
 import json
-import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from textwrap import dedent
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import yaml
@@ -24,7 +23,9 @@ from pydantic import ValidationError
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from parser.grammar.atomese import LinkAtom
+from parser.ontology.catalog import OntologyCatalog, load_ontology_catalog
 from parser.semantic.backends import ModelBackend
+from parser.semantic.catalog_prompt import build_catalog_document_prompt
 from parser.semantic.metta_renderer import (
     MettaRenderError,
 )
@@ -38,8 +39,11 @@ from parser.semantic.normalization import (
     SemanticNormalizationError,
     normalize_semantic_result,
 )
+from parser.semantic.output_cleanup import clean_model_output
 from parser.semantic.schema import SemanticParseResult
-from parser.student.student_prompt import build_student_prompt
+
+if TYPE_CHECKING:
+    from hybrid_miner.contracts.semantic_document import SemanticDocument
 
 
 class SemanticParseError(ValueError):
@@ -118,7 +122,7 @@ def _load_predicate_schemas() -> dict[str, dict[str, object]]:
 
 PREDICATE_SCHEMAS = _load_predicate_schemas()
 
-# Only semantic predicates from YAML are exposed to the LLM.
+# Historical reader vocabulary; active generation uses the ontology catalogs.
 ALLOWED_PREDICATES = ", ".join(sorted(PREDICATE_SCHEMAS))
 
 
@@ -137,11 +141,6 @@ def _build_predicate_guide() -> str:
 
 PREDICATE_GUIDE = _build_predicate_guide()
 
-_CODE_FENCE_RE = re.compile(
-    r"^```(?:json)?\s*(.*?)\s*```$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-
 
 def _iter_all_assertions(result: SemanticParseResult):
     """Yield standalone assertions and assertions contained in rules."""
@@ -157,6 +156,8 @@ class SemanticParserConfig:
     """Configuration shared by both semantic parser roles."""
 
     model_name: str
+    # Retained constructor compatibility. The active extraction prompt's
+    # identity is derived from its assembled guidance, not this legacy label.
     prompt_version: str = "2.0.0"
 
     def __post_init__(self) -> None:
@@ -188,12 +189,20 @@ class _BaseSemanticParser:
         config: SemanticParserConfig,
         model: Any = None,
         tokenizer: Any = None,
+        catalog: OntologyCatalog | None = None,
+        model_revision: str | None = None,
+        require_structured_output: bool = False,
     ) -> None:
         """Create a parser with either backend or a loaded model."""
         self._backend = backend
         self._config = config
         self._model = model
         self._tokenizer = tokenizer
+        self._catalog = catalog
+        if model_revision is not None and not model_revision.strip():
+            raise ValueError("model_revision cannot be empty")
+        self._model_revision = model_revision
+        self._require_structured_output = require_structured_output
 
     @property
     def provider_name(self) -> str:
@@ -207,58 +216,39 @@ class _BaseSemanticParser:
 
     @property
     def prompt_version(self) -> str:
-        return self._config.prompt_version
+        """Return the active prompt identity without invoking the model."""
+        catalog = (
+            self._catalog if self._catalog is not None else load_ontology_catalog()
+        )
+        return build_catalog_document_prompt("prompt identity", catalog=catalog).version
 
     @staticmethod
-    def build_prompt(sentence: str, context: str = "") -> str:
-        """Build the structured semantic extraction prompt."""
-        with _PARSER_PROMPT_CONFIG_PATH.open("r", encoding="utf-8") as file:
-            config = yaml.safe_load(file)
-        system_prompt = config["parser"]["system_prompt"].replace(
-            "{allowed_predicates}", ALLOWED_PREDICATES
-        )
-        system_prompt = system_prompt.replace("{predicate_guide}", PREDICATE_GUIDE)
-        prompt = config["parser"]["prompt_template"].format(
-            system_prompt=system_prompt,
+    def build_prompt(
+        sentence: str, context: str = "", *, catalog: OntologyCatalog | None = None
+    ) -> str:
+        """Build the same catalog-constrained prompt used for document labels."""
+        if not sentence.strip():
+            raise ValueError("The sentence cannot be empty")
+        return build_catalog_document_prompt(
+            sentence,
+            catalog=catalog if catalog is not None else load_ontology_catalog(),
             context=context,
-            sentence=sentence,
-        )
-        return dedent(prompt).strip()
+        ).text
 
     @staticmethod
     def clean_model_output(output: str) -> str:
-        """Clean model output and extract a JSON object when possible."""
-        cleaned = output.strip()
+        """Unwrap JSON presentation without altering decoded semantic values."""
+        return clean_model_output(output)
 
-        # Case 1: Remove an optional Markdown JSON code fence.
-        match = _CODE_FENCE_RE.fullmatch(cleaned)
-        if match:
-            cleaned = match.group(1).strip()
-
-        # Case 2: Output is already valid JSON.
-        try:
-            json.loads(cleaned)
-            return cleaned
-        except json.JSONDecodeError:
-            pass
-
-        # Case 3: Extract JSON preceded by explanatory text.
-        decoder = json.JSONDecoder()
-
-        for index, character in enumerate(cleaned):
-            if character != "{":
-                continue
-
-            try:
-                obj, _ = decoder.raw_decode(cleaned[index:])
-            except json.JSONDecodeError:
-                continue
-
-            if isinstance(obj, dict):
-                return json.dumps(obj)
-
-        # Leave invalid output unchanged so validation reports the error.
-        return cleaned
+    def build_document_prompt(self, source_text: str, context: str = ""):
+        """Inspect the prompt for this instance's configured catalog."""
+        return build_catalog_document_prompt(
+            source_text,
+            catalog=(
+                self._catalog if self._catalog is not None else load_ontology_catalog()
+            ),
+            context=context,
+        )
 
     @staticmethod
     def repair_known_predicate_contract(
@@ -674,38 +664,155 @@ class _BaseSemanticParser:
         else:
             raise ValueError("No backend or model available")
 
-    def _parse_json_to_metta(self, json_output: str) -> list[LinkAtom]:
-        """Parse JSON, normalize, validate, render to MeTTa."""
-        # 1. Parse JSON
+    def _generate_response(
+        self, prompt: str, *, output_schema: dict[str, Any] | None = None
+    ) -> str:
+        """Execute a document-target request and clean only its response envelope."""
+        generate_json = getattr(self._backend, "generate_json", None)
+        if (
+            output_schema is not None
+            and self._require_structured_output
+            and not callable(generate_json)
+        ):
+            raise ValueError(
+                "The selected backend does not support JSON-schema decoding"
+            )
         try:
-            data = json.loads(json_output)
-            result = SemanticParseResult.model_validate(data)
+            if output_schema is not None and callable(generate_json):
+                output = generate_json(
+                    prompt=prompt, model=self.model_name, schema=output_schema
+                )
+            else:
+                output = self._generate_text(prompt)
+        except Exception as error:
+            raise ModelGenerationError(
+                f"{self.parser_role} parser failed with model {self.model_name!r}: "
+                f"backend raised {type(error).__name__}"
+            ) from error
+        return self.clean_model_output(output)
+
+    def generate_document_target(
+        self,
+        source_text: str,
+        *,
+        catalog: OntologyCatalog | None = None,
+        context: str = "",
+    ) -> tuple[dict[str, Any], str]:
+        """Generate the quote-based document target with this parser's model.
+
+        This is a draft, not an accepted document. Call parse_document() for
+        source anchoring, contract validation, and ontology validation.
+        """
+        active_catalog = catalog if catalog is not None else self._catalog
+        if active_catalog is None:
+            active_catalog = load_ontology_catalog()
+        prompt = build_catalog_document_prompt(
+            source_text, catalog=active_catalog, context=context
+        )
+        from parser.semantic.catalog_output_schema import catalog_output_schema
+
+        cleaned = self._generate_response(
+            prompt.text, output_schema=catalog_output_schema(active_catalog)
+        )
+        if not cleaned:
+            raise SemanticParseError("The model returned an empty response")
+        try:
+            payload = json.loads(cleaned)
         except json.JSONDecodeError as error:
-            raise SemanticParseError(f"Invalid JSON output: {error}") from error
+            raise SemanticParseError("The model returned invalid JSON") from error
+        if not isinstance(payload, dict) or set(payload) not in (
+            {"entities", "assertions"},
+            {"entities", "assertions", "rules"},
+        ):
+            raise SemanticParseError(
+                "Document output must contain entities, assertions, and optional rules"
+            )
+        if not isinstance(payload["entities"], list) or not isinstance(
+            payload["assertions"], list
+        ):
+            raise SemanticParseError("Catalog entities and assertions must be lists")
+        if "rules" in payload and not isinstance(payload["rules"], list):
+            raise SemanticParseError("Document rules must be a list")
+        return payload, prompt.version
+
+    def parse_document(
+        self, *, document_id: str, corpus_id: str, source_text: str, context: str = ""
+    ) -> SemanticDocument:
+        """Parse an identified source document into the shared contract."""
+        document, _ = self.parse_document_with_target(
+            document_id=document_id,
+            corpus_id=corpus_id,
+            source_text=source_text,
+            context=context,
+        )
+        return document
+
+    def parse_document_with_target(
+        self, *, document_id: str, corpus_id: str, source_text: str, context: str = ""
+    ) -> tuple[SemanticDocument, dict[str, object]]:
+        """Return a validated document and its normalized quote-based label."""
+        from parser.semantic.catalog_document_parser import (
+            CATALOG_PARSER_VERSION,
+            prepare_catalog_target,
+        )
+
+        catalog = (
+            self._catalog if self._catalog is not None else load_ontology_catalog()
+        )
+        payload, prompt_version = self.generate_document_target(
+            source_text, catalog=catalog, context=context
+        )
+        document, payload = prepare_catalog_target(
+            payload,
+            document_id=document_id,
+            corpus_id=corpus_id,
+            source_text=source_text,
+            parser_provenance={
+                "model": self.model_name,
+                "parser_version": CATALOG_PARSER_VERSION,
+                "prompt_version": prompt_version,
+                "ontology_versions": catalog.versions,
+                "provider": self.provider_name,
+                "model_revision": self._model_revision,
+            },
+            catalog=catalog,
+        )
+        return document, payload
+
+    @classmethod
+    def read_legacy_result(
+        cls,
+        output: str,
+        *,
+        sentence: str,
+        context: str = "",
+        aliases: Mapping[str, str] | None = None,
+        alias_types: Mapping[str, str] | None = None,
+    ) -> SemanticParseResult:
+        """Read historical records without invoking a teacher or student."""
+        if not sentence.strip():
+            raise ValueError("The sentence cannot be empty")
+        cleaned = cls.clean_model_output(output)
+        if not cleaned:
+            raise SemanticParseError("The legacy record is empty")
+        try:
+            result = SemanticParseResult.model_validate_json(cleaned)
         except ValidationError as error:
-            raise SemanticParseError(f"Invalid structured output: {error}") from error
-
-        # 2. Normalize
+            raise SemanticParseError(
+                f"Invalid structured legacy record: {error}"
+            ) from error
         try:
-            result = normalize_semantic_result(result)
+            result = normalize_semantic_result(
+                result, aliases=aliases, alias_types=alias_types
+            )
         except SemanticNormalizationError as error:
-            raise SemanticParseError(f"Normalization failed: {error}") from error
-
-        # 3. Validate predicates and arguments
-        result = self.repair_ambiguous_pronouns(result)
-        result = self.repair_known_predicate_contract(result)
-        result = self.validate_predicates(result)
-        result = self.validate_arguments(result)
-        result = self.repair_rule_duplication(result)
-
-        # 4. Render to MeTTa
-        try:
-            expressions = self.render_metta(result)
-        except MettaRenderError as error:
-            raise SemanticParseError(f"Render failed: {error}") from error
-
-        # 5. Validate and return
-        return self.validate_rendered_metta(expressions)
+            raise SemanticParseError(str(error)) from error
+        result = cls.repair_ambiguous_pronouns(result)
+        result = cls.repair_known_predicate_contract(result)
+        result = cls.validate_predicates(result)
+        result = cls.validate_arguments(result)
+        result = cls.repair_rule_duplication(result)
+        return cls.validate_source_spans(result, sentence=sentence, context=context)
 
     def generate_structured(
         self,
@@ -715,84 +822,56 @@ class _BaseSemanticParser:
         aliases: Mapping[str, str] | None = None,
         alias_types: Mapping[str, str] | None = None,
     ) -> SemanticParseResult:
-        """Generate, normalize, and validate one structured model response."""
-        normalized_sentence = sentence.strip()
-        if not normalized_sentence:
+        """Derive a compatibility view from one canonical generation."""
+        from parser.semantic.compatibility import document_to_legacy_result
+
+        document = self.parse(sentence, context=context)
+        return document_to_legacy_result(
+            document, aliases=aliases, alias_types=alias_types
+        )
+
+    def parse(self, sentence: str, context: str = "") -> SemanticDocument:
+        """Extract the sentence, using optional reference-only background."""
+        from hashlib import sha256
+
+        if not sentence.strip():
             raise ValueError("The sentence cannot be empty")
-
-        prompt = self.build_prompt(
-            sentence=normalized_sentence,
-            context=context.strip(),
-        )
-
-        try:
-            output = self._generate_text(prompt)
-        except Exception as error:
-            raise ModelGenerationError(
-                f"{self.parser_role} parser failed with model {self.model_name!r}"
-            ) from error
-
-        cleaned = self.clean_model_output(output)
-        if not cleaned:
-            raise ModelGenerationError("The model returned an empty response")
-
-        try:
-            result = SemanticParseResult.model_validate_json(cleaned)
-        except ValidationError as error:
-            raise SemanticParseError(
-                f"The model returned invalid structured semantic output:{error}"
-            ) from error
-
-        try:
-            result = normalize_semantic_result(
-                result,
-                aliases=aliases,
-                alias_types=alias_types,
-            )
-        except SemanticNormalizationError as error:
-            raise SemanticParseError(str(error)) from error
-        result = self.repair_ambiguous_pronouns(result)
-        result = self.repair_known_predicate_contract(result)
-        result = self.validate_predicates(result)
-        result = self.validate_arguments(result)
-        result = self.repair_rule_duplication(result)
-        result = self.validate_source_spans(
-            result,
-            sentence=normalized_sentence,
+        return self.parse_document(
+            document_id="text-"
+            + sha256(
+                ((context + "\0") if context else "").encode("utf-8")
+                + sentence.encode("utf-8")
+            ).hexdigest(),
+            corpus_id="interactive",
+            source_text=sentence,
             context=context,
         )
-
-        return result
-
-    def parse(
-        self,
-        sentence: str,
-        context: str = "",
-        *,
-        aliases: Mapping[str, str] | None = None,
-        alias_types: Mapping[str, str] | None = None,
-    ) -> list[LinkAtom]:
-        """Convert text into validated Atomese LinkAtom objects."""
-        result = self.generate_structured(
-            sentence=sentence,
-            context=context,
-            aliases=aliases,
-            alias_types=alias_types,
-        )
-        expressions = self.render_metta(result)
-        return self.validate_rendered_metta(expressions)
 
 
 # ── Reference Parser (Teacher) ───────────────────────────────────────────────
 
 
 class ReferenceSemanticParser(_BaseSemanticParser):
-    """High-accuracy parser used for offline annotation and dataset generation."""
+    """Reference model parser for offline annotation and dataset generation."""
 
     parser_role = "reference"
 
-    def __init__(self, *, backend: ModelBackend, config: SemanticParserConfig):
-        super().__init__(backend=backend, config=config)
+    def __init__(
+        self,
+        *,
+        backend: ModelBackend,
+        config: SemanticParserConfig,
+        catalog: OntologyCatalog | None = None,
+        model_revision: str | None = None,
+        require_structured_output: bool = False,
+    ):
+        super().__init__(
+            backend=backend,
+            config=config,
+            catalog=catalog,
+            model_revision=model_revision,
+            require_structured_output=require_structured_output,
+        )
 
 
 # ── Distilled Parser (Student) ──────────────────────────────────────────────
@@ -807,12 +886,26 @@ class DistilledSemanticParser(_BaseSemanticParser):
         self,
         model_dir: str,
         device: str = "auto",
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 3072,
         num_beams: int = 4,
+        *,
+        catalog: OntologyCatalog | None = None,
     ):
         self.model_dir = Path(model_dir)
         self.max_new_tokens = max_new_tokens
         self.num_beams = num_beams
+
+        metadata_path = self.model_dir / "training_metadata.json"
+        if metadata_path.exists():
+            self.metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        else:
+            self.metadata = {"base_model": "unknown"}
+        if not isinstance(self.metadata, dict):
+            raise ValueError("Student training metadata must be a JSON object")
+        from parser.semantic.catalog_student import validate_catalog_student_checkpoint
+
+        catalog = catalog if catalog is not None else load_ontology_catalog()
+        validate_catalog_student_checkpoint(self.model_dir, catalog=catalog)
 
         # Load tokenizer from disk
         self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_dir))
@@ -836,7 +929,10 @@ class DistilledSemanticParser(_BaseSemanticParser):
                 with torch.cuda.device(index):
                     supports_bf16 = supports_bf16 and torch.cuda.is_bf16_supported()
         if not supports_bf16:
-            print("Using float32 for distilled inference on the requested device")
+            print(
+                "Using float32 for distilled inference on the requested device",
+                file=sys.stderr,
+            )
 
         # Load model from disk
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -846,18 +942,10 @@ class DistilledSemanticParser(_BaseSemanticParser):
         )
         self.model.eval()
 
-        # Load metadata
-        metadata_path = self.model_dir / "training_metadata.json"
-        if metadata_path.exists():
-            with open(metadata_path) as f:
-                self.metadata = json.load(f)
-        else:
-            self.metadata = {"base_model": "unknown"}
-
         # Create config
         config = SemanticParserConfig(
             model_name=self.metadata.get("base_model", "unknown"),
-            prompt_version=self.metadata.get("prompt_version", "2.0.0"),
+            prompt_version=self.metadata.get("prompt_version") or "2.0.0",
         )
 
         # Initialize base class with model and tokenizer
@@ -866,35 +954,36 @@ class DistilledSemanticParser(_BaseSemanticParser):
             config=config,
             model=self.model,
             tokenizer=self.tokenizer,
+            catalog=catalog,
         )
 
-        print(f"DistilledSemanticParser loaded from {model_dir}")
-        print(f"  Base model: {self.metadata.get('base_model', 'unknown')}")
+        print(f"DistilledSemanticParser loaded from {model_dir}", file=sys.stderr)
+        print(
+            f"  Base model: {self.metadata.get('base_model', 'unknown')}",
+            file=sys.stderr,
+        )
 
     @classmethod
     def from_pretrained(
         cls,
         model_dir: str,
         device: str = "auto",
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 3072,
         num_beams: int = 4,
+        *,
+        catalog: OntologyCatalog | None = None,
     ) -> DistilledSemanticParser:
         """Load a saved model for inference."""
-        return cls(model_dir, device, max_new_tokens, num_beams)
-
-    @staticmethod
-    def build_prompt(sentence: str, context: str = "") -> str:
-        """Use the same prompt as student training and evaluation."""
-        return build_student_prompt(sentence, context)
+        return cls(model_dir, device, max_new_tokens, num_beams, catalog=catalog)
 
 
 # ── Builder functions ─────────────────────────────────────────────────────────
 
 
 def build_distilled_parser(
-    model_dir: str = "models/distil_parser",
+    model_dir: str = "models/semantic_document_parser",
     device: str = "auto",
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 3072,
     num_beams: int = 4,
 ) -> DistilledSemanticParser:
     """Build a distilled parser from a saved model directory."""
