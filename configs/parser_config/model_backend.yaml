@@ -49,6 +49,7 @@ profiles:
     host_env: OLLAMA_HOST
     max_output_tokens: 512
     num_ctx: 24576
+    single_call: True
 
   ollama_qwen05:
     provider: ollama
@@ -57,6 +58,7 @@ profiles:
     max_output_tokens: 3072
     num_ctx: 24576
     temperature: 0.0
+    single_call: True
 
   ollama_qwen25_3b:
     provider: ollama
@@ -65,6 +67,7 @@ profiles:
     max_output_tokens: 3072
     num_ctx: 24576
     temperature: 0.0
+    single_call: True
 
   ollama_qwen3_8b:
     provider: ollama
@@ -74,6 +77,7 @@ profiles:
     num_ctx: 24576
     think: false
     temperature: 0.0
+    single_call: True
 
   ollama_gemma3_4b:
     provider: ollama
@@ -82,6 +86,7 @@ profiles:
     max_output_tokens: 3072
     num_ctx: 24576
     temperature: 0.0
+    single_call: True
 
   ollama_llama31_8b:
     provider: ollama
@@ -90,6 +95,7 @@ profiles:
     max_output_tokens: 3072
     num_ctx: 24576
     temperature: 0.0
+    single_call: True
 
   ollama_catalog:
     # Teacher: extracts catalog documents to build the student's training data.
@@ -101,6 +107,7 @@ profiles:
     num_ctx: 24576
     think: false
     temperature: 0.0
+    single_call: True
 
   transformers_local:
     # A locally downloaded Hugging Face model; no provider API key is required.
@@ -108,6 +115,7 @@ profiles:
     model: Qwen/Qwen2.5-3B-Instruct
     hf_token_env: HF_TOKEN
     max_new_tokens: 512
+    single_call: True
 
   semantic_document_student:
     # Student: a small local model fine-tuned on the teacher's output.
@@ -117,3 +125,4 @@ profiles:
     max_new_tokens: 3072
     role: student
     add_special_tokens: false
+    single_call: True
