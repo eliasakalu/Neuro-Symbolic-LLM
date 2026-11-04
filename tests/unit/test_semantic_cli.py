@@ -11,7 +11,7 @@ from parser.semantic import cli, model_config
 from parser.semantic.backends import CallableBackend
 from parser.semantic.dataset import verify_split_overlap
 from parser.semantic.schema import SEMANTIC_CONTRACT_VERSION
-from tests.semantic_fixtures import pair, target
+from tests.semantic_fixtures import answer_for, pair, target
 from tests.semantic_fixtures import result as fixture_result
 
 
@@ -32,7 +32,7 @@ def backend(monkeypatch):
 
         source = prompt.rsplit("<source_text>\n", 1)[1].split("\n</source_text>", 1)[0]
 
-        return json.dumps(target(source))
+        return json.dumps(answer_for(prompt, target(source)))
 
     monkeypatch.setattr(
         model_config, "create_backend", lambda profile: CallableBackend(generate)
@@ -50,14 +50,14 @@ def test_parse_defaults_to_current_parse_result_json(backend, capsys):
     assert result["contract_version"] == SEMANTIC_CONTRACT_VERSION
     assert result["document"]["source_text"] == "Mira left."
     assert result["extraction"]["assertions"][0]["predicate"] == "Event"
-    assert len(backend) == 2
+    assert len(backend) == 1
 
 
 def test_parse_metta_is_a_derived_view(backend, capsys):
     assert cli.main(["parse", "Mira left.", "--format", "metta"]) == 0
 
     assert capsys.readouterr().out.strip() == "(Event e1)"
-    assert len(backend) == 2
+    assert len(backend) == 1
 
 
 @pytest.mark.parametrize("command", ["build-dataset", "export-documents"])

@@ -36,6 +36,13 @@ def target(text):
     }
 
 
+def answer_for(prompt, payload):
+    """Add the plan that a one-call prompt asks for; other prompts get payload."""
+    if "## STEP 1: PLAN" in prompt:
+        return {"plan": {"clauses": [], "discourse": "none"}, **payload}
+    return payload
+
+
 def result(text="Mira left.", *, catalog=None) -> SemanticParseResult:
     """Parse text with a fixed general-extraction response."""
     parser = ReferenceSemanticParser(

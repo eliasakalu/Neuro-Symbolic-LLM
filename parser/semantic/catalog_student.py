@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from parser.ontology.catalog import OntologyCatalog
-from parser.semantic.catalog_prompt import build_catalog_document_prompt
+from parser.semantic.catalog_prompt import (
+    build_catalog_document_prompt,
+    build_single_call_prompt,
+)
 from parser.semantic.schema import (
     SEMANTIC_CONTRACT_VERSION,
     SemanticExtraction,
@@ -100,7 +103,8 @@ def validate_catalog_student_pair(
     prompt = build_catalog_document_prompt(
         source_text, catalog=catalog, context=context
     )
-    if provenance.get("prompt_version") != prompt.version:
+    one_call = build_single_call_prompt(source_text, catalog=catalog, context=context)
+    if provenance.get("prompt_version") not in {prompt.version, one_call.version}:
         raise ValueError(
             "Catalog student prompt version does not match the active prompt"
         )

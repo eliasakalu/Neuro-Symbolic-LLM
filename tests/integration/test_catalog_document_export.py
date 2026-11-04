@@ -25,7 +25,7 @@ from parser.semantic.semantic_parser import (
 )
 from symbolic_pipeline.document_export import export_semantic_documents
 from symbolic_pipeline.miner_bundle import load_catalog_bundle
-from tests.semantic_fixtures import target
+from tests.semantic_fixtures import answer_for, target
 
 
 def _source_line(
@@ -47,7 +47,7 @@ def _source_text(prompt: str) -> str:
 
 def _answer(*, prompt: str, model: str) -> str:
     """Answer every prompt with a valid extraction of its own source text."""
-    return json.dumps(target(_source_text(prompt)))
+    return json.dumps(answer_for(prompt, target(_source_text(prompt))))
 
 
 def _parser(generate=_answer, catalog=None, model_name="teacher-model"):
@@ -318,7 +318,7 @@ def test_build_dataset_label_matches_export_and_student_validation(
 
     def generate(**kwargs):
         calls.append(kwargs)
-        return json.dumps(draft)
+        return json.dumps(answer_for(kwargs["prompt"], draft))
 
     monkeypatch.setattr(
         model_config, "create_backend", lambda profile: CallableBackend(generate)
@@ -364,7 +364,9 @@ def test_dataset_keeps_complete_results_with_a_filtered_view(
     monkeypatch.setattr(
         model_config,
         "create_backend",
-        lambda _: CallableBackend(lambda **__: json.dumps(payload)),
+        lambda _: CallableBackend(
+            lambda *, prompt, model: json.dumps(answer_for(prompt, payload))
+        ),
     )
     (tmp_path / "source.jsonl").write_text(
         _source_line("one", "Mira left.") + "\n", encoding="utf-8"
