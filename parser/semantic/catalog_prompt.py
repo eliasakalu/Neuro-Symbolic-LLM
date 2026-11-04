@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -356,4 +357,99 @@ def build_router_prompt(source_text: str) -> CatalogDocumentPrompt:
     return CatalogDocumentPrompt(
         version=f"{version}+sha256.{_prompt_fingerprint(template)}",
         text=template.replace("{source_text}", source_text),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Experimental one-call prompt
+# ---------------------------------------------------------------------------
+
+
+_INPUT_SECTION = re.compile(r"\n[ \t]*## \d+\. INPUT\b")
+
+
+def _instructions_only(prompt: str, label: str) -> str:
+    """Return a prompt's instructions without its trailing INPUT section."""
+
+    matches = list(_INPUT_SECTION.finditer(prompt))
+    if not matches:
+        raise ValueError(f"{label.capitalize()} prompt has no INPUT section")
+    return prompt[: matches[-1].start()].rstrip()
+
+
+def build_single_call_prompt(
+    source_text: str,
+    *,
+    catalog: OntologyCatalog,
+    context: str = "",
+) -> CatalogDocumentPrompt:
+    """Join the general and discourse instructions into one extraction prompt.
+
+    The single_call template in parser_prompt.yaml asks the model to plan,
+    extract general semantics and then discourse relations in one answer, so
+    one call replaces the general, router and discourse calls. The general and
+    discourse instructions come unchanged from their own prompt files.
+    """
+
+    if not isinstance(source_text, str) or not source_text.strip():
+        raise ValueError("source_text must contain non-whitespace text")
+
+    try:
+        raw = yaml.safe_load(_ROUTER_PROMPT_PATH.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise ValueError(
+            f"Cannot load single-call prompt configuration: {error}"
+        ) from error
+    single = raw.get("single_call") if isinstance(raw, dict) else None
+    if not isinstance(single, dict):
+        raise ValueError("parser_prompt.yaml requires a single_call mapping")
+    version = single.get("prompt_version")
+    template = single.get("system_prompt")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("Single-call prompt requires a nonempty prompt_version")
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError("Single-call prompt requires a nonempty system_prompt")
+    _require_placeholders(
+        template,
+        (
+            "{general_instructions}",
+            "{discourse_instructions}",
+            "{context}",
+            "{source_text}",
+        ),
+        "single-call",
+    )
+
+    _, general_prompt = _load_prompt_config(_GENERAL_PROMPT_PATH, "general")
+    general = _instructions_only(
+        general_prompt.replace(
+            "{ontology_versions}", ", ".join(_general_catalog_versions(catalog))
+        ).replace("{catalog_guide}", _catalog_guide(catalog)),
+        "general",
+    )
+
+    try:
+        discourse_guide = _discourse_catalog_guide(catalog)
+    except ValueError:
+        discourse = "No discourse predicates are active. Skip Step 3."
+    else:
+        _, discourse_prompt = _load_prompt_config(_DISCOURSE_PROMPT_PATH, "discourse")
+        discourse = _instructions_only(
+            discourse_prompt.replace(
+                "{discourse_catalog_guide}", discourse_guide
+            ).replace("{extraction_guidance}", _DISCOURSE_GUIDANCE),
+            "discourse",
+        )
+
+    guidance = (
+        template.replace("{general_instructions}", general)
+        .replace("{discourse_instructions}", discourse)
+        .rstrip()
+    )
+    rendered = guidance.replace("{context}", context).replace(
+        "{source_text}", source_text
+    )
+    return CatalogDocumentPrompt(
+        version=f"{version}+sha256.{_prompt_fingerprint(guidance)}",
+        text=rendered,
     )

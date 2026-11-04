@@ -242,3 +242,20 @@ def test_parser_exposes_active_prompt_identity_without_generation():
     ).version
 
     assert parser.prompt_version == expected
+
+
+def test_single_call_prompt_joins_general_and_discourse_instructions() -> None:
+    from parser.semantic.catalog_prompt import build_single_call_prompt
+
+    prompt = build_single_call_prompt(
+        "Although it rained, Nora left.", catalog=load_ontology_catalog()
+    )
+
+    assert prompt.version.startswith("single-call-v1+sha256.")
+    assert "## STEP 1: PLAN" in prompt.text
+    assert "<general_instructions>" in prompt.text
+    assert "<discourse_instructions>" in prompt.text
+    assert "Concession(" in prompt.text
+    assert prompt.text.count("<source_text>") == 1
+    assert "{general_semantics}" not in prompt.text
+    assert "{source_text}" not in prompt.text

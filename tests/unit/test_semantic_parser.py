@@ -372,3 +372,121 @@ def test_distilled_precision_respects_requested_device(monkeypatch, tmp_path) ->
 
     assert loader.call_args.kwargs["torch_dtype"] == torch.float32
     assert loader.call_args.kwargs["device_map"] == "cpu"
+
+
+_CONCESSION_SOURCE = "Although it rained, Nora left."
+
+
+def _single_call_answer(plan: dict[str, Any] | None) -> dict[str, Any]:
+    """A one-call answer for the concession sentence."""
+
+    def quote(text: str) -> dict[str, Any]:
+        return {"text": text, "occurrence": 0}
+
+    def assertion(
+        predicate: str, arguments: list[tuple[str, str]], evidence: str, **fields: Any
+    ) -> dict[str, Any]:
+        return {
+            "predicate": predicate,
+            "relation": None,
+            "arguments": [{"entity_id": e, "role": r} for e, r in arguments],
+            "fallback": False,
+            "polarity": "positive",
+            "factuality": "asserted",
+            "modality": "none",
+            "confidence": 0.9,
+            "evidence": [quote(evidence)],
+            "alternatives": [],
+            **fields,
+        }
+
+    answer: dict[str, Any] = {
+        "entities": [
+            {
+                "id": "rain_clause",
+                "kind": None,
+                "entity_type": "Clause",
+                "mention": quote("it rained"),
+            },
+            {
+                "id": "leave_clause",
+                "kind": None,
+                "entity_type": "Clause",
+                "mention": quote("Nora left"),
+            },
+            {
+                "id": "nora",
+                "kind": None,
+                "entity_type": "Entity",
+                "mention": quote("Nora"),
+            },
+        ],
+        "assertions": [
+            assertion("Clause", [("rain_clause", "clause_id")], "it rained"),
+            assertion("Clause", [("leave_clause", "clause_id")], "Nora left"),
+            assertion("Evaluation", [], "it rained", relation="rain", fallback=True),
+            assertion(
+                "Evaluation",
+                [("nora", "agent")],
+                "Nora left",
+                relation="leave",
+                fallback=True,
+            ),
+            assertion(
+                "Concession",
+                [("rain_clause", "statement"), ("leave_clause", "counter_statement")],
+                "Although it rained, Nora left",
+            ),
+        ],
+        "rules": [],
+    }
+    if plan is not None:
+        answer = {"plan": plan, **answer}
+    return answer
+
+
+class _SchemaBackend:
+    """Record every call and answer schema-constrained requests."""
+
+    provider_name = "fake"
+
+    def __init__(self, answer: dict[str, Any]) -> None:
+        self.answer = answer
+        self.schemas: list[dict[str, Any]] = []
+
+    def generate(self, *, prompt: str, model: str) -> str:
+        return json.dumps(self.answer)
+
+    def generate_json(self, *, prompt: str, model: str, schema: dict[str, Any]) -> str:
+        self.schemas.append(schema)
+        return json.dumps(self.answer)
+
+
+def test_single_call_mode_extracts_discourse_in_one_call() -> None:
+    backend = _SchemaBackend(
+        _single_call_answer(
+            {"clauses": ["it rained", "Nora left"], "discourse": "Concession: although"}
+        )
+    )
+    parser = ReferenceSemanticParser(
+        backend=backend,
+        config=SemanticParserConfig(model_name="fake", single_call=True),
+    )
+
+    result = parser.parse(_CONCESSION_SOURCE)
+
+    assert len(backend.schemas) == 1
+    assert list(backend.schemas[0]["properties"])[0] == "plan"
+    assert backend.schemas[0]["required"][0] == "plan"
+    assert result.provenance.prompt_version.startswith("single-call-v1+sha256.")
+    assert "Concession" in [a.predicate for a in result.extraction.assertions]
+
+
+def test_single_call_mode_rejects_an_answer_without_a_plan() -> None:
+    parser = ReferenceSemanticParser(
+        backend=_SchemaBackend(_single_call_answer(None)),
+        config=SemanticParserConfig(model_name="fake", single_call=True),
+    )
+
+    with pytest.raises(SemanticParseError, match="no valid plan"):
+        parser.parse(_CONCESSION_SOURCE)

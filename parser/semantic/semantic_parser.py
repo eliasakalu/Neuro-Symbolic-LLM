@@ -28,6 +28,7 @@ from parser.semantic.catalog_prompt import (
     build_catalog_document_prompt,
     build_discourse_prompt,
     build_router_prompt,
+    build_single_call_prompt,
 )
 from parser.semantic.metta_renderer import MettaRenderError
 from parser.semantic.metta_renderer import (
@@ -43,6 +44,7 @@ from parser.semantic.normalization import (
 from parser.semantic.output_cleanup import clean_model_output
 from parser.semantic.schema import (
     DiscourseExtraction,
+    ExtractionPlan,
     ParserRoute,
     SemanticAssertion,
     SemanticExtraction,
@@ -87,6 +89,7 @@ class SemanticParserConfig:
 
     model_name: str
     enable_routing: bool = True
+    single_call: bool = False
 
     def __post_init__(self) -> None:
         if not self.model_name.strip():
@@ -735,6 +738,47 @@ class _BaseSemanticParser:
             raise SemanticParseError("Model output must be a JSON object")
         return payload, prompt.version
 
+    def _build_single_call_output_schema(self) -> dict[str, Any]:
+        """Extend the extraction schema with a required plan written first."""
+
+        schema = self._build_extraction_output_schema()
+        plan = ExtractionPlan.model_json_schema()
+        plan.pop("title", None)
+        plan.pop("description", None)
+        plan["required"] = list(plan["properties"])
+        schema["properties"] = {"plan": plan, **schema["properties"]}
+        # Every top-level field is required, so decoding cannot stop after the plan.
+        schema["required"] = list(schema["properties"])
+        return schema
+
+    def generate_single_call_payload(
+        self, document: SourceDocument, *, catalog: OntologyCatalog
+    ) -> tuple[dict[str, Any], str]:
+        """Ask for plan, general and discourse extraction in one model call.
+
+        Returns the extraction payload without its plan, and the prompt
+        version. The plan only steers generation; it is checked and dropped.
+        """
+        prompt = build_single_call_prompt(
+            document.source_text, catalog=catalog, context=document.context
+        )
+        cleaned = self._generate_json_text(
+            prompt.text, output_schema=self._build_single_call_output_schema()
+        )
+        if not cleaned:
+            raise SemanticParseError("The model returned an empty response")
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError as error:
+            raise SemanticParseError("The model returned invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise SemanticParseError("Model output must be a JSON object")
+        try:
+            ExtractionPlan.model_validate(payload.pop("plan", None))
+        except ValidationError as error:
+            raise SemanticParseError("The model returned no valid plan") from error
+        return payload, prompt.version
+
     def route_document(self, document: SourceDocument) -> tuple[ParserRoute, str]:
         """Decide whether a discourse pass is needed."""
         prompt = build_router_prompt(document.source_text)
@@ -940,9 +984,14 @@ class _BaseSemanticParser:
     ) -> SemanticParseResult:
         """Parse one identified source document into a SemanticParseResult."""
         catalog = self._catalog
-        payload, prompt_version = self.generate_extraction_payload(
-            document, catalog=catalog
-        )
+        if self._config.single_call:
+            payload, prompt_version = self.generate_single_call_payload(
+                document, catalog=catalog
+            )
+        else:
+            payload, prompt_version = self.generate_extraction_payload(
+                document, catalog=catalog
+            )
         try:
             extraction = SemanticExtraction.model_validate(
                 normalize_extraction_payload(payload, aliases=aliases)
@@ -963,7 +1012,7 @@ class _BaseSemanticParser:
             self.validate_predicates(result)
             self.validate_arguments(result)
 
-            if self._config.enable_routing:
+            if self._config.enable_routing and not self._config.single_call:
                 route, router_version = self.route_document(document)
 
                 prompt_versions = [

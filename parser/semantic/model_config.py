@@ -312,7 +312,10 @@ def build_reference_semantic_parser(
         )
     return ReferenceSemanticParser(
         backend=create_backend(profile),
-        config=SemanticParserConfig(model_name=profile.model),
+        config=SemanticParserConfig(
+            model_name=profile.model,
+            single_call=_optional_bool_setting(profile, "single_call") is not False,
+        ),
         catalog=catalog,
         model_revision=model_revision,
         require_structured_output=require_structured_output,

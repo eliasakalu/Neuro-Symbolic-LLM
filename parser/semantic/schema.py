@@ -299,6 +299,19 @@ class DiscourseExtraction(SemanticSchemaModel):
         return self
 
 
+class ExtractionPlan(SemanticSchemaModel):
+    """The model's short plan in one-call mode, written before its extraction.
+
+    ``clauses`` quotes each clause of the source; ``discourse`` is "none" or
+    the discourse relation the model sees with its marker, for example
+    "Concession: although". The plan steers generation and is not part of
+    the parse result.
+    """
+
+    clauses: list[str] = Field(default_factory=list)
+    discourse: str = Field(min_length=1)
+
+
 class ParserRoute(SemanticSchemaModel):
     """Validated router decision; general extraction is mandatory."""
 
